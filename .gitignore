@@ -1,0 +1,6 @@
+/target/
+/dist/*.exe
+/dist/self_test_report.json
+__pycache__/
+*.pdb
+*.partial

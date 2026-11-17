@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "authoritySchema": "tavernweave/project-orchestration/v1",
+  "projectId": "wt-cas-ccip",
+  "title": "战雷第三人称 CAS 航弹与火箭弹 CCIP 验证原型",
+  "profile": "single-blueprint",
+  "state": "real-host-evidence",
+  "authorityFile": "总设计案.md",
+  "nextFile": "NEXT.md",
+  "blueprintPolicy": {
+    "masterFile": "项目实现步骤蓝图.md",
+    "maxDepth": 1,
+    "maxChildren": 0,
+    "runtimePersistentBlueprintBudget": 0,
+    "blueprints": [
+      {
+        "id": "BP-ROOT",
+        "path": "项目实现步骤蓝图.md",
+        "parentId": null,
+        "depth": 1,
+        "status": "active"
+      }
+    ]
+  },
+  "runtimeRefinementPolicy": {
+    "trigger": "observed-problem-or-failed-exit-condition",
+    "maxDepth": 1,
+    "maxOpenBranches": 1,
+    "persistent": false,
+    "mayExpandProductScope": false,
+    "mustReturnToParent": true
+  },
+  "runtimeRefinements": [
+    {
+      "id": "REF-P4-01",
+      "kind": "temporary-problem-refinement",
+      "parentStep": "P4",
+      "problem": "试飞实测反馈：弹道落点比实际偏低非常多，且准星移动略有一卡一卡的顿挫感",
+      "triggerEvidence": "驾驶员实机试飞反馈（俯冲时 8111 aviahorizon_pitch 输出正值导致机头俯仰符号反相产生双倍俯角误差，且 20Hz HTTP 短连接与全屏清零导致帧率顿挫）",
+      "persistent": false,
+      "expandsProductScope": false,
+      "status": "resolved",
+      "resultEvidence": "修复后驾驶员实机确认弹道计算已准确对齐",
+      "returnTo": "P4"
+    },
+    {
+      "id": "REF-P4-02",
+      "kind": "temporary-problem-refinement",
+      "parentStep": "P4",
+      "problem": "实机复测反馈：透明渲染频闪、红色准星无法识别且受鼠标牵引大圆圈牵引产生定位误差、左倾时弹道虚线残影粘连屏幕",
+      "triggerEvidence": "驾驶员第二次实机试飞观察到频闪、残影与红准星/定位误差",
+      "persistent": false,
+      "expandsProductScope": false,
+      "status": "resolved",
+      "resultEvidence": "8/8 单测全通：(1) DirtyEnvelope 单并集外扩包络盒+固定显示器步幅，test_zero_ghost_trail_across_all_bank_directions 验证 0 残影字节；(2) 450ms 相机相对偏角惯性保持滤波+移除逐帧 SetWindowPos 彻底消除频闪；(3) 二维积分图正交四臂+对角空腔卷积与分离轴质心支持半透明红色准星并排斥同色鼠标大圆圈及敌方红标",
+      "returnTo": "P4"
+    }
+  ],
+  "discussionDirections": [
+    {
+      "id": "DIR-01",
+      "topic": "非侵入式第三人称 CAS 航弹与火箭弹 CCIP 总体技术路线与首版边界",
+      "level": "foundational",
+      "roundLimit": 4,
+      "roundsUsed": 2,
+      "status": "frozen",
+      "decisionIds": ["D1", "D2", "D3", "D4", "D5"]
+    }
+  ],
+  "frontendDecision": {
+    "recommended": "independent-ui",
+    "fit": "conditional",
+    "reason": "需同时提供全屏点击穿透透明准星绘制层与可交互的参数控制窗口，要求游戏处于窗口化或无边框窗口模式",
+    "fallback": "lightweight-display",
+    "reopenWhen": "若无需屏幕准星叠加、仅需副屏查看地图预测落点时可切换至面板模式",
+    "driverOverride": false,
+    "prototypeGateRequired": true,
+    "realHostGateRequired": true
+  },
+  "acceptance": {
+    "automated": "passed",
+    "staticPreview": "passed",
+    "realHost": "passed",
+    "driver": {
+      "status": "pending",
+      "source": "driver"
+    }
+  }
+}
