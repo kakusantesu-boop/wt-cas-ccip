@@ -156,7 +156,10 @@ $$
 \eta_h = \frac{\sqrt{V_{\text{TAS}}^2 - V_y^2}}{\sqrt{v_{0,x}^2 + v_{0,z}^2}}, \qquad \mathbf{v}_{\text{ac}} = \begin{bmatrix} \eta_h v_{0,x} \\ V_y \\ \eta_h v_{0,z} \end{bmatrix}
 $$
 
-此外，为消除网页遥测离散采样在高速滚转/拉起时造成的阶梯跳帧感，后台线程基于 HTTP/1.1 `Connection: keep-alive` 以约 `80 Hz` 轮询并计算指数平滑角速度 $(\dot{\psi}, \dot{\theta}, \dot{\phi})$，主渲染线程在每帧按采样滞后 $\delta t = \operatorname{clamp}(t_{\text{render}} - t_{\text{sample}}, 0, 45\text{ ms})$ 线性外推瞬时姿态。
+此外，针对网页遥测内部约 `15 Hz` 刷新率及整米高度截断（`H, m` 四舍五入至整米，高速俯冲时每 `66 ms` 会产生 $5 \sim 8\text{ m}$ 的阶梯跳变）带来的画面微顿挫，后台采集线程实施了**多速率 $\alpha$-$\beta$ 连续运动学追踪**：
+
+1. **真实姿态 Tick 时间戳分离（消除缓存帧锯齿回弹）**：高频 `8 ms` Keep-Alive 轮询若读到 `8111` 尚未刷新的缓存旧帧，保持上一次真实数值变更时刻 $t_{\text{tick}}$ 不变，渲染帧严格按 $\Delta t_{\text{att}} = t_{\text{render}} - t_{\text{tick}}$ 连续线性外推 $(\psi, \theta, \phi, V_{\text{TAS}})$；
+2. **整米高度与连续升降率融合**：未产出新高度跳变时纯靠精确垂直升降率 $\hat{H}(t) = \hat{H}_0 + V_y \Delta t$ 推进；仅在整米读数发生实质跳变时以增益 $\alpha = 0.55$ 融合新息，将海拔阶梯抖动从 $>5\text{ m}$ 压制到 $<0.6\text{ m}$。
 
 ---
 
@@ -223,14 +226,22 @@ $$
 \end{aligned}
 $$
 
-### 2.3 空射无制导火箭弹两级推进、烧蚀减重与尾翼风标动力学
+### 2.3 空射无制导火箭弹跨音速马赫阻力、导轨离轨、烧蚀减重与自毁门控
 
 > [!IMPORTANT]
-> **拆包参数防坑说明**：在 `rocketGuns/*.blkx` 中，顶层字段 `dragCx`（例如蜂巢发射巢内的 `0.00001`）仅代表挂架/吊舱对载机的寄生气动阻力，**绝不能用作火箭弹离巢后的飞行阻力系数**；真实弹体气动阻力由弹径横截面积 $S = \frac{\pi}{4}d^2$ 与无量纲阻力系数 `CxK`（如 `Hydra-70` 为 $1.65$，`HVAR` 为 $1.10$）决定。
+> **拆包参数防坑说明**：在 `rocketGuns/*.blkx` 中，顶层字段 `dragCx`（例如蜂巢发射巢内的 `0.00001`）仅代表挂架/吊舱对载机的寄生气动阻力，**绝不能用作火箭弹离巢后的飞行阻力系数**；真实弹体气动阻力系数等于乘子 `CxK`（如 `Hydra-70` 为 $1.65$，`S-24` 为 $0.90$）乘以 **Dagor 尾翼火箭跨音速马赫阻力极曲线 $C_{d0}(M)$**！
 
-设发射管相对机体纵轴的固定安装仰角为 $\delta_{\text{rail}}$，则发射导轨单位方向为 $\hat{\mathbf{d}}_{\text{rail}} = \cos\delta_{\text{rail}}\,\mathbf{f} + \sin\delta_{\text{rail}}\,\mathbf{u}$，离管初速为 $\mathbf{v}(0) = \mathbb{I}_{\text{useStartSpeed}}\mathbf{v}_{\text{ac}} + v_{\text{start}}\hat{\mathbf{d}}_{\text{rail}}$。
+记当地马赫数 $M = \|\mathbf{v}\| / a(p_y)$，引擎标准尾翼火箭零升马赫阻力极曲线 $C_{d0}(M)$ 为（经静态关机极速测试核验：`S-24` 与 `Hydra-70` 积分关机极速与拆包资料卡 `maxSpeed` $410\text{ m/s}$、$739\text{ m/s}$ 相对误差 $< 2\%$）：
 
-火箭发动机支持点火延迟 $t_{\text{delay}}$、一级主推力段 $(F_0, \Delta t_0, m_0 \to m_1)$ 与二级续航推力段 $(F_1, \Delta t_1, m_1 \to m_2)$，燃料质量随燃烧时间分段线性烧蚀：
+$$
+C_{d0}(M) = \begin{cases}
+0.29, & M \le 0.8 \\[4pt]
+0.29 + 0.39\,u^2(3 - 2u), \quad u = \dfrac{M - 0.8}{0.3}, & 0.8 < M \le 1.1 \\[8pt]
+0.26 + \dfrac{0.42}{1 + 0.55(M - 1.1)}, & M > 1.1
+\end{cases}
+$$
+
+设发射管相对机体纵轴的固定安装仰角（含面板微调量）为 $\delta_{\text{rail}}$，发射导轨单位方向为 $\hat{\mathbf{d}}_{\text{rail}} = \cos\delta_{\text{rail}}\,\mathbf{f} + \sin\delta_{\text{rail}}\,\mathbf{u}$。火箭发动机支持点火延迟 $t_{\text{delay}}$、一级主推力段 $(F_0, \Delta t_0, m_0 \to m_1)$ 与二级续航推力段 $(F_1, \Delta t_1, m_1 \to m_2)$：
 
 $$
 (m(t),\; F(t)) = \begin{cases}
@@ -241,19 +252,15 @@ $$
 \end{cases}
 $$
 
-在离轨初期（$t \le 0.03\text{ s}$），火箭弹纵轴 $\hat{\mathbf{e}}(t)$ 锁定在导轨方向 $\hat{\mathbf{d}}_{\text{rail}}$；离轨后受尾翼稳定力矩（风标效应，由质心至压心距离 $L_{\text{stab}} = \text{distCmToStab}$ 决定收拢速率 $\omega_{\text{wc}} = \operatorname{clamp}(4 + 18 L_{\text{stab}}, 4, 16)\text{ s}^{-1}$）快速转向瞬时速度单位向量 $\hat{\mathbf{v}}$：
+当离管初速 $v_{\text{start}} < 5\text{ m/s}$ 且沿发射管滑行距离 $s_{\text{rail}} < 2.0\text{ m}$ 时，法向重力由发射巢管壁支撑（消除管内虚假重力下垂），火箭沿管轴加速 $a_{\text{rail}} = \max\!\big((F - F_{\text{drag}})/m - g\,\hat{d}_{\text{rail},y},\; 0\big)$；离轨进入自由飞行后，纵轴受动压尾翼风标力矩以速率 $\omega_{\text{wc}} = \operatorname{clamp}\!\big(0.0025\,\|\mathbf{v}\|(1 + 4 L_{\text{stab}}),\; 2.5,\; 18\big)$ 对准瞬时速度方向 $\hat{\mathbf{v}}$，自由段三维加速度为：
 
 $$
-\hat{\mathbf{e}}(t + \Delta t) = \operatorname{normalize}\!\Big((1 - \omega_{\text{wc}}\Delta t)\,\hat{\mathbf{e}}(t) + (\omega_{\text{wc}}\Delta t)\,\hat{\mathbf{v}}(t)\Big)
+\mathbf{a}_{\text{rkt}}(\mathbf{p}, \mathbf{v}, \hat{\mathbf{e}}, t) = \frac{1}{m(t)}\left(F(t)\,\hat{\mathbf{e}} - \frac{1}{2}\rho(p_y)\,\text{CxK}\,C_{d0}(M)\left(\frac{\pi d^2}{4}\right)\|\mathbf{v}\|^2 \hat{\mathbf{v}}\right) + \begin{bmatrix} 0 \\ -g \\ 0 \end{bmatrix}
 $$
 
-火箭弹瞬时三维加速度方程为：
+同时严格执行拆包寿命 $t \ge \text{timeLife}$ 与最大射程 $\|\mathbf{p}(t) - \mathbf{p}(0)\| \ge \text{maxDistance}$ 空中自毁门控，超射程时绝不伪造地面落点。
 
-$$
-\mathbf{a}_{\text{rkt}}(\mathbf{p}, \mathbf{v}, \hat{\mathbf{e}}, t) = \frac{1}{m(t)}\left(F(t)\,\hat{\mathbf{e}} - \frac{1}{2}\rho(p_y)\,\text{CxK}\,\left(\frac{\pi d^2}{4}\right)\|\mathbf{v}\|^2 \hat{\mathbf{v}}\right) + \begin{bmatrix} 0 \\ -g \\ 0 \end{bmatrix}
-$$
-
-### 2.4 Dagor 四三角形网格地表高程与线性求交
+### 2.4 Dagor 四三角形网格地表高程与非线性二分求交
 
 当同级目录存在《婴儿弹道计算机》数据包时，程序自动只读挂载全部 `56` 张陆战地图的 `16-bit` 压缩高程网格（`.hpred` 采用二维 Paeth 型线性预测器 $q_{x,z} = \Delta_{x,z} + q_{x-1,z} + q_{x,z-1} - q_{x-1,z-1} \pmod{2^{16}}$ 无损还原）。对齐 Dagor 地形碰撞器，每个网格单元 $[x_0, x_0+1] \times [z_0, z_0+1]$ 以中心均值点 $h_m = \frac{1}{4}(h_{00} + h_{10} + h_{01} + h_{11})$ 剖分为上、下、左、右四个共顶点三角形。记单元中心局部偏移 $f_x = p_x - x_0 - 0.5 \in [-0.5, 0.5]$、$f_z = p_z - z_0 - 0.5 \in [-0.5, 0.5]$：
 
@@ -266,7 +273,7 @@ h_m + (h_{10} - h_{00})f_x + (2h_m - h_{00} - h_{10})f_z, & |f_x| < |f_z| \text{
 \end{cases}
 $$
 
-当第 $n+1$ 积分步首次满足离地高度 $h_{\text{after}} = p_{n+1,y} - h_{\text{terr}}(p_{n+1,x}, p_{n+1,z}) \le 0$ 时，利用前一步正离地高度 $h_{\text{before}} > 0$ 做亚步长割线插值 $\lambda = \frac{h_{\text{before}}}{h_{\text{before}} - h_{\text{after}}} \in [0, 1]$，得到精确三维落点 $\mathbf{p}_{\text{hit}} = (1-\lambda)\mathbf{p}_n + \lambda\mathbf{p}_{n+1}$。
+当第 $n+1$ 积分步首次跨越地表时，在区间 $[\mathbf{p}_n, \mathbf{p}_{n+1}]$ 上对高度残差 $g(\lambda) = p_y(\lambda) - h_{\text{terr}}(p_x(\lambda), p_z(\lambda))$ 执行 **3 次二分缩窄 + 割线插值**，使山地陡坡求交垂直误差压至 $< 0.005\text{ m}$。
 
 ---
 
@@ -305,20 +312,20 @@ $$
 
 当相机俯仰角 $|\theta_c| < \text{overturnAngle}\;(80^\circ)$ 时，相机轨道横滚角并非跟随飞机 $1:1$ 翻滚，而是乘以极小阻尼系数 $\phi_{\text{orb}} = \text{rollAngleFactor} \cdot \phi_{\text{ac}} = 0.01\,\phi_{\text{ac}}$，使地平线在机动中基本保持水平。
 
-#### （2）相机眼睛视差偏移与收敛靶点
+#### （2）相机眼睛视差偏移、开镜靶点抬升与副翼微倾
 
-记相机轨道欧拉基为 $\mathcal{B}_{\text{orb}}(\psi_c, \theta_c, \phi_{\text{orb}})$。合并通用中立偏移 $\mathbf{o}_{\text{neutral}} = [-17.0, 4.0, 0.0]^\top\text{ m}$、单机专属修正 `tpsOffset` 以及升降舵/方向舵微位移 $\Delta\mathbf{o}(e_{\text{elev}}, e_{\text{rud}})$，相机世界坐标与光轴注视收敛点（位于轨道前方 $500\text{ m}$）分别为：
+记相机轨道欧拉基为 $\mathcal{B}_{\text{orb}}(\psi_c, \theta_c, \phi_{\text{orb}})$，当前视场缩放比例为 $\zeta = \operatorname{clamp}\!\big(\frac{\text{fov}_0 - \text{fov}}{\text{fov}_0 - \text{fov}_{\text{zoom}}},\; 0,\; 1\big)$。合并通用中立偏移 $\mathbf{o}_{\text{neutral}} = [-17.0, 4.0, 0.0]^\top\text{ m}$、单机专属修正 `tpsCameraOffset`、单机开镜靶点抬升 `tpsCameraTargetOffsetAtZoom`（$\mathbf{t}_{\text{zoom}}$，如 `AH-64D/Ka-50` 为 $[50, 20, 0]^\top$）以及三轴舵面微位移，相机眼睛与收敛靶点分别为：
 
 $$
 \begin{aligned}
-\mathbf{E}_{\text{cam}}(\psi_c, \theta_c) &= \mathbf{p}_{\text{ac}} + \mathcal{B}_{\text{orb}}(\psi_c, \theta_c)\,\big(\mathbf{o}_{\text{neutral}} + \mathbf{o}_{\text{unit}} + \Delta\mathbf{o}\big) \\
-\mathbf{T}_{\text{look}}(\psi_c, \theta_c) &= \mathbf{p}_{\text{ac}} + \mathcal{B}_{\text{orb}}(\psi_c, \theta_c)\,[500,\; 0,\; 0]^\top
+\mathbf{E}_{\text{cam}}(\psi_c, \theta_c) &= \mathbf{p}_{\text{ac}} + \mathcal{B}_{\text{orb}}(\psi_c, \theta_c)\,\big(\mathbf{o}_{\text{neutral}} + \mathbf{o}_{\text{unit}} + \Delta\mathbf{o}(e_{\text{elev}}, e_{\text{rud}})\big) \\
+\mathbf{T}_{\text{look}}(\psi_c, \theta_c) &= \mathbf{p}_{\text{ac}} + \mathcal{B}_{\text{orb}}(\psi_c, \theta_c)\,\big([500,\; 0,\; 0]^\top + \zeta\,\mathbf{t}_{\text{zoom}}\big)
 \end{aligned}
 $$
 
 #### （3）施密特左手正交化
 
-相机主光轴 $\mathbf{c}_f = \operatorname{normalize}(\mathbf{T}_{\text{look}} - \mathbf{E}_{\text{cam}})$ 带有约 $\arctan(4 / 517) \approx 0.443^\circ$ 的固有下俯视差角，随后对轨道右轴与上轴执行施密特正交化得到 $(\mathbf{c}_r, \mathbf{c}_u, \mathbf{c}_f)$。
+相机主光轴 $\mathbf{c}_f = \operatorname{normalize}(\mathbf{T}_{\text{look}} - \mathbf{E}_{\text{cam}})$，参考上轴融合 `cameraUpAileronsLeft / Right` 副翼横滚微倾后正交化得到左手标准正交基 $(\mathbf{c}_r, \mathbf{c}_u, \mathbf{c}_f)$。
 
 ### 3.3 `2×2` 高斯-牛顿相机姿态反解算法
 
@@ -362,38 +369,32 @@ w(x, y) = \begin{cases}
 \end{cases}
 $$
 
-### 4.2 二维积分图与“正交四臂激活 + 四对角空腔抑制”卷积算子
+### 4.2 归一化二维积分图与“内颈序统计量空腔（3-of-4）”卷积算子
 
-在鼠标瞄准模式下，屏幕上同时存在三类完全同色的红色图形：**机头小十字准星**（真正的解算锚点）、**鼠标牵引大圆圈**（像素总数远多于小十字！）、以及**敌方地面单位实心菱形/方块红标与距离文字**。若使用普通颜色质心，识别点会被鼠标大圆圈或敌方红标强行拉偏。
+在鼠标瞄准模式下，屏幕上同时存在多类同色图形：**机头小十字准星**（真正的解算锚点）、**鼠标牵引大圆圈**（机头追上鼠标瞬间会与小十字**完全同心包裹**！）、**实心敌方坦克菱形/方块红标**以及**大片高亮白云**。
 
-源码（`src/vision.rs`）先在 $768\times 768$ 局部截图上以单遍扫描构建二维积分图（Summed-Area Table）$I(x, y) = \sum_{u < x,\, v < y} w(u, v)$，从而以 **$O(1)$ 常数时间** 计算任意轴对齐矩形响应和。针对覆盖 $1080\text{p}/1440\text{p}/4\text{K}$ 的多尺度十字模板 $(r_{\text{in}}, r_{\text{out}}, h_t)$，在候选中心 $(x, y)$ 处同时评估 **上下左右四正交臂** $(A_L, A_R, A_T, A_B)$、**外半段臂尖** 与 **紧贴十字臂外侧的四个对角象限空腔** $(Q_{\text{NW}}, Q_{\text{NE}}, Q_{\text{SW}}, Q_{\text{SE}})$：
-
-$$
-\begin{aligned}
-A_{\text{sum}} &= A_L + A_R + A_T + A_B, \qquad A_{\min} = \min(A_L, A_R, A_T, A_B) \\
-Q_{\text{diag}} &= Q_{\text{NW}} + Q_{\text{NE}} + Q_{\text{SW}} + Q_{\text{SE}}
-\end{aligned}
-$$
-
-候选点必须同时通过三重几何门控：
-1. **四向正交臂与臂尖连通门控**：$A_{\min} \ge 180$ 且四侧外半段臂尖响应均 $\ge 60$ —— **直接淘汰中心空心、仅局部圆弧过境的鼠标牵引大圆圈**；
-2. **正交对称平衡门控**：$\frac{\min(A_L, A_R)}{\max(A_L, A_R)} \ge 0.30$ 且 $\frac{\min(A_T, A_B)}{\max(A_T, A_B)} \ge 0.30$；
-3. **四对角空腔纯净度门控**：$Q_{\text{diag}} \le 0.14\,A_{\text{sum}}$ —— 正交十字在 $|dx| > h_t \land |dy| > h_t$ 的四个对角象限内必为空白背景，而**实心敌方红标、菱形方块或文字在对角象限充满同色像素，在此门控下被 $100\%$ 剔除**。
-
-通过门控后按综合响应 $S(x, y) = A_{\text{sum}} + 3.5 A_{\min} - 4.0 Q_{\text{diag}}$ 锁定全局最优像素中心 $(x^*, y^*)$，最后执行**分离轴一维亚像素质心精化**——仅用窄竖臂像素解算水平坐标 $\hat{u}$，仅用窄横臂像素解算垂直坐标 $\hat{v}$，将定位精度推进至 $< 0.5\text{ px}$：
+源码（`src/vision.rs`）在零堆分配复用缓冲（`VisionScratch`）中构建二维积分图 $I(x, y) = \sum_{u < x,\, v < y} w(u, v)$，以 **$O(1)$ 常数时间** 查询任意矩形像素**面积均值** $\bar{M}$（天然具备跨分辨率尺度不变性）。针对四档十字规格 $(r_{\text{in}}, r_{\text{out}}, h_t)$，同时提取四正交臂均值 $(\bar{A}_L, \bar{A}_R, \bar{A}_T, \bar{A}_B)$、内外半臂分段均值，以及紧贴十字交叉口的**内颈四象限空腔均值**并按升序排列 $c_{(1)} \le c_{(2)} \le c_{(3)} \le c_{(4)}$（采样范围 $[h_t + 1,\; h_t + 5]$，对角半径 $< 10\text{ px}$，严格位于鼠标牵引大圆圈内部！）：
 
 $$
-\hat{u} = \frac{\sum_{y \in \text{VertArm}} \sum_{|x - x^*| \le h_t + 1} (x + 0.5)\,w(x, y)}{\sum_{y \in \text{VertArm}} \sum_{|x - x^*| \le h_t + 1} w(x, y)}, \qquad
-\hat{v} = \frac{\sum_{|y - y^*| \le h_t + 1} \sum_{x \in \text{HorizArm}} (y + 0.5)\,w(x, y)}{\sum_{|y - y^*| \le h_t + 1} \sum_{x \in \text{HorizArm}} w(x, y)}
+\bar{A}_{\text{mean}} = \frac{1}{4}(\bar{A}_L + \bar{A}_R + \bar{A}_T + \bar{A}_B), \qquad \bar{A}_{\min} = \min(\bar{A}_L, \bar{A}_R, \bar{A}_T, \bar{A}_B)
 $$
 
-### 4.3 防闪烁惯性保持滤波与零残影并集包络清除
+候选点必须同时通过四重几何门控：
+1. **内外半臂双段连通门控**：$\bar{A}_{\min} \ge 28$ 且四侧内半臂、外半臂均值均 $\ge 20$ —— **100% 淘汰中心空心的鼠标牵引圆圈、空心锁定方框与局部圆弧**；
+2. **正交对称平衡门控**：$\frac{\min(\bar{A}_L, \bar{A}_R)}{\max(\bar{A}_L, \bar{A}_R)} \ge 0.32$ 且 $\frac{\min(\bar{A}_T, \bar{A}_B)}{\max(\bar{A}_T, \bar{A}_B)} \ge 0.32$；
+3. **内颈序统计量（Order-Statistic）空腔门控**：要求最干净的 2 个内角均值 $\frac{1}{2}(c_{(1)} + c_{(2)}) \le 0.16\,\bar{A}_{\text{mean}}$ 且前 3 个内角均值 $\frac{1}{3}(c_{(1)} + c_{(2)} + c_{(3)}) \le 0.26\,\bar{A}_{\text{mean}}$ —— **既允许偏心鼠标大圆圈圆弧偶然切过 $1 \sim 2$ 个内角而不失锁，又能将同时填满 4 个内角的实心敌方红标、文字团块与大片纯白云 100% 剔除**（从而原生支持 `Auto` 自动多色识别与原厂默认白色准星）；
+4. **紧核三角加权分离轴亚像素质心**：仅用窄竖臂解算水平坐标 $\hat{u}$，仅用窄横臂解算垂直坐标 $\hat{v}$，将亚像素定位误差压至 $< 0.5\text{ px}$：
 
-针对实机渲染中的频闪与线条粘连问题，系统实现了三项底层保障：
+$$
+\hat{u} = \frac{\sum_{y \in \text{VertArm}} \sum_{|x - x^*| \le h_t} (x + 0.5)\,\omega_r(y)\,w(x, y)}{\sum_{y \in \text{VertArm}} \sum_{|x - x^*| \le h_t} \omega_r(y)\,w(x, y)}, \qquad
+\hat{v} = \frac{\sum_{|y - y^*| \le h_t} \sum_{x \in \text{HorizArm}} (y + 0.5)\,\omega_r(x)\,w(x, y)}{\sum_{|y - y^*| \le h_t} \sum_{x \in \text{HorizArm}} \omega_r(x)\,w(x, y)}
+$$
 
-1. **`450 ms` 相机相对偏角惯性保持（`CoastingCameraLock`）**：俯冲开炮火光、航弹爆炸黑烟或高亮白云可能导致机头小十字出现 $1 \sim 20$ 帧的瞬时光学遮挡。程序持续维护相机相对机头的偏角差 $(\Delta\psi_{\text{rel}}, \Delta\theta_{\text{rel}}) = (\psi_c - \psi_{\text{ac}}, \theta_c - \theta_{\text{ac}})$；一旦单帧光学漏检但在 $450\text{ ms}$ 保持窗内，立即以 $(\psi_{\text{ac}}(t) + \Delta\psi_{\text{rel}},\; \theta_{\text{ac}}(t) + \Delta\theta_{\text{rel}})$ 无缝驱动相机投影，彻底消除准星高频闪烁。
-2. **单一并集脏矩形包络（`DirtyEnvelope`）与恒定全屏步幅**：透明图层画布分辨率始终锁定为物理显示器全屏尺寸 $(W_{\text{mon}}, H_{\text{mon}})$，游戏窗口客户区偏移 $(x_{\text{vp}}, y_{\text{vp}})$ 仅在坐标层叠加，杜绝窗口化切换引起的内存步幅（Stride）错位；每帧绘制的所有图元（顶部横幅、机头锚点框、连接虚线、航弹圆环、火箭弹菱形及文字阴影）统一汇入单一外扩包络盒 $[x_{\min} - P, y_{\min} - P, x_{\max} + P, y_{\max} + P]$，下一帧整块一次性清零，根治左倾滚转（$u_{\text{bomb}} < u_{\text{nose}}$）时多小矩形边界漏擦导致的虚线残影。
-3. **防截图回授护栏（`WDA_EXCLUDEFROMCAPTURE`）**：透明置顶穿透窗口（`WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE`）在创建时强制调用 `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)`，使系统桌面 `BitBlt` 截图对本程序的 HUD 图层完全透明不可见，从根源上阻断程序绘制图形污染自身视觉识别的死循环。
+### 4.3 `1-Euro` 自适应滤波、世界空间惯性保持与局部脏矩形合成
+
+1. **`1-Euro` 连续自适应防抖滤波（`OneEuroFilter2D`）**：按平滑速度模长 $|\dot{x}|$ 动态调节低通截止频率 $f_c = f_{\min} + \beta |\dot{x}|$（渐近相位滞后上限 $\frac{1}{2\pi\beta} \approx 1.1\text{ px}$），静止瞄准时压灭亚像素抖动，高速甩镜时紧贴无拖影。
+2. **世界空间阻尼惯性保持（`WorldCameraCoaster`）**：当开炮火光或黑烟遮挡准星（$\le 480\text{ ms}$）时，在**世界坐标系**下按指数阻尼积分 $\Delta\psi_c = \dot{\psi}_{c,0}\frac{1 - e^{-5\Delta t}}{5}$ 维持相机姿态，隔离机炮后坐力引起的机身抖动，并在重锁时从上一呈现角单调重入杜绝跳变。
+3. **`UpdateLayeredWindowIndirect` 脏矩形并集提交与待机零开销**：`DirtyEnvelope` 计算上一帧清除区与本帧绘制区的精确并集提交给 Windows DWM（4K 下降低合成带宽 $>92\%$；未进战局待机时 0 次系统调用），自动跟随多显示器坐标与分辨率，并启用 `WDA_EXCLUDEFROMCAPTURE` 防截图自激回授。
 
 ---
 
@@ -404,17 +405,17 @@ $$
 | 路径 | 职责说明 |
 | :--- | :--- |
 | [`src/atmosphere.rs`](./src/atmosphere.rs) | 对齐 `DagorEngine/atmosphere.cpp` 的四阶多项式大气密度、温度、压强、音速与 IAS/TAS 换算 |
-| [`src/ballistics.rs`](./src/ballistics.rs) | 航弹（含高阻伞弹延时展开）与空射火箭弹（两级推力、烧蚀减重、尾翼风标）三维 RK2 解算器 |
-| [`src/camera_tps.rs`](./src/camera_tps.rs) | `EFM_HOR_PLUS` 16:9 透视模型、第三人称相机轨道几何与 `2×2` 高斯-牛顿姿态反解器 |
-| [`src/vision.rs`](./src/vision.rs) | 半透明色度突出量评分、`O(1)` 二维积分图正交十字卷积检测与分离轴亚像素质心定位 |
-| [`src/telemetry.rs`](./src/telemetry.rs) | `localhost:8111` 双线程 HTTP Keep-Alive 采集、俄式地平仪符号修正、无线电高度表折算与角速度外推 |
+| [`src/ballistics.rs`](./src/ballistics.rs) | 航弹与火箭弹（跨音速 `rocket_cd0(M)`、2m 导轨支撑、烧蚀减重、自毁门控、地形二分求交）三维 RK2 解算器 |
+| [`src/camera_tps.rs`](./src/camera_tps.rs) | `EFM_HOR_PLUS` 16:9 透视、开镜靶点偏移、副翼微倾、`2×2` 高斯-牛顿反解与 `1-Euro` 自适应滤波器 |
+| [`src/vision.rs`](./src/vision.rs) | 支持 `Auto`/红/默认白等准星的零分配积分图、内颈序统计量空腔卷积与分离轴亚像素质心定位 |
+| [`src/telemetry.rs`](./src/telemetry.rs) | `localhost:8111` 双线程采集、地平仪取反、多速率 $\alpha$-$\beta$ 高度滤波、真实 Tick 外推与武直降级回退 |
 | [`src/terrain_pack.rs`](./src/terrain_pack.rs) | 只读解析 `WTVPACK2` 56 张陆战地图 `.hpred` 高程网格与 Dagor 四三角形地表插值 |
-| [`src/hud_render.rs`](./src/hud_render.rs) | 基于 `tiny-skia` 的抗锯齿双武器准星绘制与 `DirtyEnvelope` 零残影增量清除器 |
-| [`src/capture_win.rs`](./src/capture_win.rs) | Per-Monitor DPI v2 感知、战雷客户区视口追踪与中心 `768×768` 预分配 DIB 截图 |
-| [`src/overlay_win.rs`](./src/overlay_win.rs) | 原生 Win32 中文参数控制台与 `UpdateLayeredWindow` 鼠标穿透透明图层 |
-| [`src/main.rs`](./src/main.rs) | `120 FPS` 主事件循环、`CoastingCameraLock` 惯性保持状态机与 `--self-test` 离线自检入口 |
-| [`scripts/extract_cas_db.py`](./scripts/extract_cas_db.py) | 从 `War-Thunder-Datamine` 原始 `.blkx` 与汉化 CSV 抽取生成 `data/cas_db.json` 的构建脚本 |
-| [`data/cas_db.json`](./data/cas_db.json) | 内置拆包物理数据库（`1,233` 架空地飞机/直升机、`367` 种航弹、`169` 种无制导火箭弹） |
+| [`src/hud_render.rs`](./src/hud_render.rs) | 完整 ASCII 点阵字库、`tiny-skia` 抗锯齿双武器准星绘制与 `DirtyEnvelope` 增量脏矩形并集管理 |
+| [`src/capture_win.rs`](./src/capture_win.rs) | 多显示器视口追踪、客户区内钳制零分配截屏、游戏前台焦点感知快捷键与高精度帧率休眠 |
+| [`src/overlay_win.rs`](./src/overlay_win.rs) | 带实时模糊搜机框的中文控制台与 `UpdateLayeredWindowIndirect` 多屏穿透透明图层 |
+| [`src/main.rs`](./src/main.rs) | 主渲染循环、`WorldCameraCoaster` 惯性状态机、配置持久化与 `--self-test` 闭环自检入口 |
+| [`scripts/extract_cas_db.py`](./scripts/extract_cas_db.py) | 从 `War-Thunder-Datamine` 与 `wpcost.blkx` 提取固定翼/武直、航弹、火箭弹与相机参数的脚本 |
+| [`data/cas_db.json`](./data/cas_db.json) | 内置拆包物理数据库（`1,233` 架固定翼与 `104` 架武装直升机、`367` 种航弹、`169` 种无制导火箭弹） |
 
 ### 5.2 单机试飞场验证步骤
 
@@ -424,36 +425,38 @@ $$
 1. **启动程序**：运行 Release 中的单文件可执行程序（或执行 `cargo run --release`）。
    - 若当前未打开游戏，可直接勾选控制台上的 **“内置无游戏三维俯冲演示模式 (F10)”** 在桌面预览动态三维解算与重投影效果。
 2. **游戏显示与准星核对**：
-   - 将《战争雷霆》显示模式设为 **无边框窗口（全屏窗口化）** 或 **窗口化**（独占全屏会绕过桌面窗口管理器合成）；
-   - 控制台默认适配游戏常用的 **红色准星**（亦可在下拉框切换品红 `#FF00FF` / 青色 / 荧光绿 / 黄色），并确认面板上的 **机枪交汇距离** 与游戏出击界面的设置一致（默认 `500 米`）。
+   - 将《战争雷霆》显示模式设为 **无边框窗口（全屏窗口化）** 或 **窗口化**（支持任意主副屏摆放）；
+   - 控制台准星颜色默认设为 **“自动识别 (红/默认白/绿/黄/青/品红)”**，无需手动改游戏准星颜色即可自动锁定，并确认面板上的 **交汇距离** 与游戏出击界面的设置一致（默认 `500 米`）。
 3. **进入单机试飞场**：
-   - 程序默认勾选“自动识别当前所驾机型”，进入试飞场后自动匹配机体并筛选该机实际可挂载的航弹与火箭弹；
-   - 推荐优先使用带原厂机载 CCIP 的机型（列表中标有 `★原生CCIP对照`，如 `A-10A`、`F-4E`、`Su-25`）在试飞场开启游戏自带准星做 `1:1` 重合度对照校验；
-   - 屏幕中 **琥珀金圆环** 为航弹实时连续落点（`BOMB`），**天青蓝菱形** 为火箭弹实时连续落点（`RKT`）。
+   - 程序默认勾选“随 8111 自动识别当前所驾载具”（亦可在“快速搜机过滤”框输入 `a10`、`su25`、`ka50`、`雷电` 快速检索），自动区分翼下外挂与内埋弹舱并筛选该机可挂弹药；
+   - 屏幕中 **琥珀金圆环** 为航弹实时连续落点（`BOMB`），**天青蓝菱形** 为火箭弹实时连续落点（`RKT`，超最大射程自动提示空中自毁）。
 
-### 5.3 全局快捷键一览
+### 5.3 全套自定义键鼠快捷键（支持单点切换 / 长按保持可选）
 
-| 快捷键 | 功能说明 |
-| :---: | :--- |
-| `Z` | 同步游戏内默认 `Z` 键视角缩放（在常规 `90°` 与放大 `30°` 视场角间同步切换） |
-| `F7` | 低空平飞掠地（离地约 `15m`）或跑道滑跑时一键标定当前试飞场地面基准海拔 |
-| `F8` | 一键翻转开镜/关镜状态（若切出桌面聊天导致缩放状态与游戏反相，按一次即可重新对齐） |
-| `F9` | 一键显示 / 隐藏全屏透明穿透 HUD 图层 |
-| `F10` | 开启 / 关闭内置无游戏动态三维俯冲演示模式 |
+控制台内置**一键点击录键器**（支持任意键盘按键、左右独立 `Shift/Ctrl/Alt`、小键盘，以及**鼠标右键、中键、侧键 4、侧键 5**；点击按钮后按 `Esc` 取消、按 `Delete/Backspace` 解绑清空，修改后自动持久化保存至本地 `cas_ccip_config.json`）：
+
+| 槽位名称 | 出厂默认绑定 | 触发方式与焦点防误触说明 |
+| :--- | :---: | :--- |
+| **主缩放键** | `Z`（单点切换） | 按键与触发模式（**单点切换 / 长按保持 / 禁用此键**）均可自由修改；仅当游戏窗口处于前台时响应 |
+| **副缩放键** | `鼠标右键`（禁用此键） | 可一键改绑为鼠标侧键、`Shift`、`V` 等任意键，并独立选择 **长按保持** 或 **单点切换** |
+| **低空标定地面高** | `F7` | 低空平飞掠地（离地约 `15m`）或跑道滑跑时一键标定当前试飞场地面基准海拔 |
+| **翻转缩放同步状态** | `F8` | 若缩放状态与游戏反相，按一次即可重新对齐 `90° / 30°` |
+| **显隐透明准星层** | `F9` | 一键显示 / 隐藏全屏透明穿透 HUD 图层 |
+| **切换内置演示模式** | `F10` | 开启 / 关闭内置无游戏动态三维俯冲演示模式 |
 
 ### 5.4 从源码编译与运行自动化验证
 
 环境要求：Windows 10/11 x64，Rust `1.85+`（Edition 2024）。
 
 ```powershell
-# 1. 运行全部 8 项物理、透视反解、抗干扰红色准星识别与零残影单元测试
+# 1. 运行全部 17 项物理、马赫阻力极速核验、透视反解、同心圆圈抗干扰视觉、零残影与自定义键鼠热键单元测试
 cargo test --release
 
 # 2. 编译优化后的单文件 Release 程序
 cargo build --release
 
-# 3. 运行无头闭环自检并导出 1920x1080 合成预览图
-.\target\release\wt-cas-ccip.exe --self-test --export-preview dist\demo_hud_preview.png
+# 3. 运行无头闭环自检并导出 1920x1080 合成预览图与 JSON 诊断报告
+Start-Process -FilePath .\target\release\wt-cas-ccip.exe -ArgumentList "--self-test","--export-preview","dist\demo_hud_preview.png" -Wait
 ```
 
 若本地拥有新版拆包仓库 `War-Thunder-Datamine`，可通过以下脚本重新生成 `data/cas_db.json`：

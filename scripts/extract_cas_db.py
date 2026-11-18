@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import math
@@ -128,6 +129,9 @@ def opt_pos(v) -> float | None:
 
 
 def vec3(v, default: list[float]) -> list[float]:
+    # Unwrap duplicate BLK key overrides serialized as list-of-lists [[x,y,z], [x,y,z]]
+    while isinstance(v, list) and v and isinstance(v[-1], list):
+        v = v[-1]
     if isinstance(v, list) and len(v) >= 3 and all(isinstance(x, (int, float)) for x in v[:3]):
         return [round(float(v[0]), 4), round(float(v[1]), 4), round(float(v[2]), 4)]
     return list(default)
@@ -205,6 +209,9 @@ def extract_camera_config(raw_cam_bytes: bytes) -> dict:
             "camera_offset_elev_down": vec3(blk.get("cameraOffsetElevatorDown"), [-14.0, 4.0, 0.0]),
             "camera_offset_rudder_left": vec3(blk.get("cameraOffsetRudderLeft"), [-14.0, 4.0, -1.0]),
             "camera_offset_rudder_right": vec3(blk.get("cameraOffsetRudderRight"), [-14.0, 4.0, 1.0]),
+            "camera_up_ailerons_left": vec3(blk.get("cameraUpAileronsLeft"), [0.0, 2.0, 0.7]),
+            "camera_up_ailerons_right": vec3(blk.get("cameraUpAileronsRight"), [0.0, 2.0, -0.7]),
+            "sensitivity_ailerons": num(blk.get("sensitivityAilerons"), 0.3),
             "roll_angle_factor": num(blk.get("rollAngleFactor"), 0.01),
             "overturn_angle": num(blk.get("overturnAngle"), 80.0),
             "fov_smoothing": num(blk.get("cameraFovSmoothing"), 0.005),
@@ -307,8 +314,10 @@ def extract_rockets(weap_lang: dict[str, tuple[str, str]]) -> dict[str, dict]:
         m_end1 = opt_pos(r.get("massEnd1")) or m_end0
         fire_delay = num(r.get("timeFireDelay") if r.get("timeFireDelay") is not None else r.get("fireDelay"), 0.0)
 
-        # Flight drag uses CxK! Never confuse pod parasite dragCx (e.g. 0.00001) with flight CxK.
-        cx_k = opt_pos(r.get("CxK")) or 1.25
+        # Flight drag uses CxK * rocket_cd0(Mach)! Never confuse pod parasite dragCx (e.g. 0.00001) with flight CxK.
+        raw_cx_k = opt_pos(r.get("CxK"))
+        cx_mach = raw_cx_k is not None
+        cx_k = raw_cx_k or opt_pos(r.get("dragCx")) or 1.25
         pod_drag_cx = num(r.get("dragCx"), 0.0)
 
         wdk_raw = r.get("WdK")
@@ -327,6 +336,7 @@ def extract_rockets(weap_lang: dict[str, tuple[str, str]]) -> dict[str, dict]:
             "caliber": round(cal, 4),
             "length": round(num(r.get("length"), 1.5), 4),
             "cx_k": round(cx_k, 5),
+            "cx_mach": cx_mach,
             "pod_drag_cx": round(pod_drag_cx, 6),
             "force0": round(force0, 2),
             "time_fire0": round(t_fire0, 4),
@@ -390,6 +400,7 @@ def extract_aircraft(
     rockets: dict[str, dict],
     containers: dict[str, list[str]],
     units_lang: dict[str, tuple[str, str]],
+    heli_ids: set[str],
 ) -> list[dict]:
     preset_files = {p.stem.lower(): p for p in PRESET_DIR.glob("*.blkx")} if PRESET_DIR.exists() else {}
     preset_cache: dict[str, dict | None] = {}
@@ -473,7 +484,7 @@ def extract_aircraft(
             continue
 
         utype = str(first(d.get("type")) or "")
-        is_heli = "helicopter" in utype.lower()
+        is_heli = (uid in heli_ids) or ("helicopter" in utype.lower())
         cockpit = d.get("cockpit") if isinstance(d.get("cockpit"), dict) else {}
 
         prefix = uid.split("_")[0].split("-")[0]
@@ -486,7 +497,9 @@ def extract_aircraft(
             "name_en": en_name,
             "is_heli": is_heli,
             "tps_offset": vec3(d.get("tpsCameraOffset"), [0.0, 0.0, 0.0]),
+            "tps_target_offset_at_zoom": vec3(d.get("tpsCameraTargetOffsetAtZoom"), [0.0, 0.0, 0.0]),
             "static_aim_pitch_deg": round(num(cockpit.get("staticAimPitch"), 0.0), 3),
+            "has_auto_bay_door": bool(d.get("hasAutomaticBayDoor")),
             "ccip_bombs": bool(d.get("haveCCIPForBombs")),
             "ccip_rockets": bool(d.get("haveCCIPForRocket")),
             "ccrp_bombs": bool(d.get("haveCCRPForBombs")),
@@ -498,28 +511,51 @@ def extract_aircraft(
 
 
 def main() -> int:
+    global DM_ROOT, ACES_DIR, FM_DIR, PRESET_DIR, ROCKET_DIR, CONTAINER_DIR, OUT_PATH
+    ap = argparse.ArgumentParser(description="提取战雷 CAS 航弹/火箭弹与 TPS 摄像机数据库")
+    ap.add_argument("--datamine", type=Path, default=DM_ROOT, help="War-Thunder-Datamine 仓库路径")
+    ap.add_argument("--out", type=Path, default=OUT_PATH, help="输出 cas_db.json 路径")
+    args = ap.parse_args()
+
+    DM_ROOT = args.datamine.resolve()
+    ACES_DIR = DM_ROOT / "aces.vromfs.bin_u"
+    FM_DIR = ACES_DIR / "gamedata" / "flightmodels"
+    PRESET_DIR = FM_DIR / "weaponpresets"
+    ROCKET_DIR = ACES_DIR / "gamedata" / "weapons" / "rocketGuns"
+    CONTAINER_DIR = ACES_DIR / "gamedata" / "weapons" / "containers"
+    OUT_PATH = args.out.resolve()
+
     dm_version = (DM_ROOT / "version").read_text("utf-8").strip() if (DM_ROOT / "version").exists() else "unknown"
     print(f"[1/5] 加载拆包本地化词表 (wt-datamine {dm_version})...")
     units_lang = load_csv("units.csv")
     weap_lang = load_csv("units_weaponry.csv")
 
-    print("[2/5] 从 git 对象库只读流式读取 camera.blkx 与 476 项 bombguns...")
+    print("[2/5] 从 git 对象库只读流式读取 camera.blkx、wpcost.blkx 与 bombguns...")
     bomb_paths = git_list_bombguns(DM_ROOT)
     cam_path = "aces.vromfs.bin_u/config/camera.blkx"
-    blobs = git_read_blobs(DM_ROOT, [cam_path] + bomb_paths)
+    wpcost_path = "char.vromfs.bin_u/config/wpcost.blkx"
+    blobs = git_read_blobs(DM_ROOT, [cam_path, wpcost_path] + bomb_paths)
 
     cam_cfg = extract_camera_config(blobs.pop(cam_path))
+    wpcost_bytes = blobs.pop(wpcost_path, b"{}")
+    wpcost_json = json.loads(wpcost_bytes.decode("utf-8"))
+    heli_ids = {
+        k.lower()
+        for k, v in wpcost_json.items()
+        if isinstance(v, dict) and "helicopter" in str(v.get("unitClass", "")).lower()
+    }
     bombs = extract_bombs(blobs, weap_lang)
-    print(f"      已提取无制导航弹/燃烧弹/减速弹: {len(bombs)} 种")
+    print(f"      已提取无制导航弹/燃烧弹/减速弹: {len(bombs)} 种, 识别直升机 ID: {len(heli_ids)} 架")
 
     print("[3/5] 提取无制导空射火箭弹与发射巢映射...")
     rockets = extract_rockets(weap_lang)
     containers = build_container_map()
     print(f"      已提取无制导火箭弹: {len(rockets)} 种, 武器挂架/发射巢: {len(containers)} 种")
 
-    print("[4/5] 扫描 1,665 架飞机与直升机挂载配置...")
-    aircraft = extract_aircraft(bombs, rockets, containers, units_lang)
-    print(f"      已提取具备 CAS 航弹/火箭弹能力的飞机与直升机: {len(aircraft)} 架")
+    print("[4/5] 扫描飞机与直升机挂载配置...")
+    aircraft = extract_aircraft(bombs, rockets, containers, units_lang, heli_ids)
+    heli_cas_cnt = sum(1 for a in aircraft if a["is_heli"])
+    print(f"      已提取具备 CAS 航弹/火箭弹能力的载具: {len(aircraft)} 架 (其中武装直升机 {heli_cas_cnt} 架)")
 
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -535,14 +571,16 @@ def main() -> int:
 
     # 关键样本断言自检
     ac_by_id = {a["id"]: a for a in aircraft}
-    for req_ac in ("a_10a_early", "p-47d-28", "su_25", "b-29"):
+    for req_ac in ("a_10a_early", "p-47d-28", "su_25", "b-29", "ah_64d", "ka_50"):
         assert req_ac in ac_by_id, f"缺失关键验证机型: {req_ac}"
         a = ac_by_id[req_ac]
         print(
-            f"  ✔ 样本核验 {req_ac}: {a['name_zh']} | tps_offset={a['tps_offset']} "
-            f"| 原生CCIP(弹={a['ccip_bombs']},箭={a['ccip_rockets']}) "
+            f"  ✔ 样本核验 {req_ac}: {a['name_zh']} | heli={a['is_heli']} | tps_offset={a['tps_offset']} "
+            f"| zoom_target_off={a['tps_target_offset_at_zoom']} | 原生CCIP(弹={a['ccip_bombs']},箭={a['ccip_rockets']}) "
             f"| 可挂炸弹={len(a['bombs'])}种, 火箭弹={len(a['rockets'])}种"
         )
+    assert ac_by_id["ah_64d"]["is_heli"] is True and ac_by_id["ka_50"]["is_heli"] is True
+    assert ac_by_id["a_10a_early"]["is_heli"] is False
     for req_b in ("us_500lb_mk_82_ldgp", "us_500lb_mk_82_ldgp_snakeye", "su_fab_500m_62t"):
         assert req_b in bombs, f"缺失关键验证航弹: {req_b}"
         b = bombs[req_b]

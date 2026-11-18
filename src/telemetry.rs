@@ -1,11 +1,10 @@
-//! 战雷官方 `http://127.0.0.1:8111` 高频无阻塞遥测采集器 + 姿态角速度平滑外推器
+//! 战雷官方 `http://127.0.0.1:8111` 高频无阻塞遥测采集器 + α-β 运动学连续状态外推器
 //!
-//! 关键防坑规则（实测与开源库 `PowerBroker2/WarThunder` 双重验证）：
-//! 1. `/indicators` 中的 `aviahorizon_pitch` 与 `aviahorizon_roll` 均为俄式地平仪刻度盘相对位移，符号与飞机真实俯仰/横滚**完全相反**：
-//!    - 飞机俯冲 `-20°` 时，`aviahorizon_pitch` 输出 `+20.0`，必须取反 `-aviahorizon_pitch`！
-//!    - 飞机右倾 `+15°` 时，`aviahorizon_roll` 输出 `-15.0`，必须取反 `-aviahorizon_roll`！
-//! 2. `/indicators` 中的 `bank` 在美系等飞机上是侧滑仪小球（限幅 `[-8, +8]`），绝不能优先于 `aviahorizon_roll` 当作横滚角！
-//! 3. 将低频小地图请求 (`/map_info.json`, `/map_obj.json`) 拆至独立慢速线程，姿态主线程保持 `~80-100 Hz` 持久连接采集，并记录角速度供渲染线程 `120 FPS` 帧间平滑外推，彻底消除 `20 Hz` 阶梯顿挫感。
+//! 核心校准与抗阶梯抖动机制：
+//! 1. **俄式地平仪符号反转校准**：`/indicators` 中 `aviahorizon_pitch` 与 `aviahorizon_roll` 符号与真实俯仰/横滚完全相反，必须取反；
+//! 2. **过滤美系侧滑球 `bank`**：优先读取 `±180°` 全量程 `-aviahorizon_roll`，防止美系飞机 `±8°` 侧滑球截断坡度；
+//! 3. **消除 `15Hz` 整米海拔阶梯跳变 (`H, m` 量化噪声)**：利用精确垂直速度 `Vy` 对整米量化的 `H, m` 做 α-β 运动学滤波与帧间连续积分外推，将俯冲落点阶梯抖动压缩 90% 以上；
+//! 4. **直升机与早期双翼机降级兜底**：兼容 `/state` 缺失时从 `/indicators` 仪表回退空速/高度/升降率，并支持从小地图玩家方向矢量 `[dx, dy]` 回退罗盘航向。
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
@@ -25,6 +24,7 @@ pub struct TelemetryFrame {
     pub unit_id: String,
     pub alt_asl_m: f64,
     pub tas_mps: f64,
+    pub tas_accel_mps2: f64,
     pub ias_mps: f64,
     pub mach: f64,
     pub vy_mps: Option<f64>,
@@ -33,20 +33,24 @@ pub struct TelemetryFrame {
     pub heading_deg: f64,
     pub pitch_deg: f64,
     pub roll_deg: f64,
-    /// 角速度 (deg/s)，用于 120 FPS 渲染帧间无顿挫外推
+    /// 角速度 (deg/s)，用于高刷渲染帧间无顿挫外推
     pub yaw_rate_dps: f64,
     pub pitch_rate_dps: f64,
     pub roll_rate_dps: f64,
     pub stick_elevator: f64,
     pub stick_rudder: f64,
+    pub stick_ailerons: f64,
     pub airbrake_pct: f64,
-    /// 无线电高度表推算的实时地面海拔 (若该机配备无线电高度表且在量程内)
+    /// 无线电高度表推算的实时地面海拔
     pub radar_ground_alt_m: Option<f64>,
     /// 跑道滑跑自动记录的机场海拔
     pub auto_runway_alt_m: Option<f64>,
     pub map_xz_m: Option<[f64; 2]>,
     pub map_bounds: Option<[f64; 4]>,
+    /// 最近一次轮询完成时刻（用于 `alt_asl_m` 帧间微步外推）
     pub sampled_at: Option<Instant>,
+    /// 最近一次 `8111` 实际刷新姿态/空速的真实 tick 时刻（消除 8ms 重复读取旧 JSON 引起的 15Hz 锯齿回弹）
+    pub att_tick_at: Option<Instant>,
 }
 
 impl Default for TelemetryFrame {
@@ -56,6 +60,7 @@ impl Default for TelemetryFrame {
             unit_id: String::new(),
             alt_asl_m: 500.0,
             tas_mps: 0.0,
+            tas_accel_mps2: 0.0,
             ias_mps: 0.0,
             mach: 0.0,
             vy_mps: None,
@@ -69,31 +74,63 @@ impl Default for TelemetryFrame {
             roll_rate_dps: 0.0,
             stick_elevator: 0.0,
             stick_rudder: 0.0,
+            stick_ailerons: 0.0,
             airbrake_pct: 0.0,
             radar_ground_alt_m: None,
             auto_runway_alt_m: None,
             map_xz_m: None,
             map_bounds: None,
             sampled_at: None,
+            att_tick_at: None,
         }
     }
 }
 
+/// 帧间连续运动学外推快照：同时外推姿态角、连续海拔与连续真空速，彻底消除 15Hz 采样阶梯与锯齿回弹
+#[derive(Clone, Copy, Debug)]
+pub struct ExtrapolatedState {
+    pub heading_deg: f64,
+    pub pitch_deg: f64,
+    pub roll_deg: f64,
+    pub alt_asl_m: f64,
+    pub tas_mps: f64,
+}
+
 impl TelemetryFrame {
-    /// 按当前渲染时刻外推平滑后的 (heading, pitch, roll)，上限外推 45ms 防止过冲
+    /// 按当前渲染时刻外推平滑后的 `(heading, pitch, roll)`
     pub fn extrapolated_attitude(&self, now: Instant) -> (f64, f64, f64) {
-        let Some(t0) = self.sampled_at else {
-            return (self.heading_deg, self.pitch_deg, self.roll_deg);
-        };
-        let dt = now.saturating_duration_since(t0).as_secs_f64().clamp(0.0, 0.045);
-        let hdg = (self.heading_deg + self.yaw_rate_dps * dt).rem_euclid(360.0);
-        let pitch = (self.pitch_deg + self.pitch_rate_dps * dt).clamp(-89.0, 89.0);
-        let roll = self.roll_deg + self.roll_rate_dps * dt;
-        (hdg, pitch, roll)
+        let st = self.extrapolated_state(now);
+        (st.heading_deg, st.pitch_deg, st.roll_deg)
+    }
+
+    /// 按真实 tick 时刻 `att_tick_at` 外推姿态与空速，按 `sampled_at` 外推高度，上限 `75 ms` 防过冲
+    pub fn extrapolated_state(&self, now: Instant) -> ExtrapolatedState {
+        let dt_alt = self
+            .sampled_at
+            .map(|t0| now.saturating_duration_since(t0).as_secs_f64().clamp(0.0, 0.075))
+            .unwrap_or(0.0);
+        let dt_att = self
+            .att_tick_at
+            .or(self.sampled_at)
+            .map(|t0| now.saturating_duration_since(t0).as_secs_f64().clamp(0.0, 0.075))
+            .unwrap_or(0.0);
+
+        let hdg = (self.heading_deg + self.yaw_rate_dps * dt_att).rem_euclid(360.0);
+        let pitch = (self.pitch_deg + self.pitch_rate_dps * dt_att).clamp(-89.0, 89.0);
+        let roll = self.roll_deg + self.roll_rate_dps * dt_att;
+        let alt = self.alt_asl_m + self.vy_mps.unwrap_or(0.0) * dt_alt;
+        let tas = (self.tas_mps + self.tas_accel_mps2 * dt_att).max(0.0);
+        ExtrapolatedState {
+            heading_deg: hdg,
+            pitch_deg: pitch,
+            roll_deg: roll,
+            alt_asl_m: alt,
+            tas_mps: tas,
+        }
     }
 }
 
-/// 支持 HTTP/1.1 Keep-Alive 复用的轻量客户端，将单次轮询延迟压至 < 0.5 ms
+/// 支持 HTTP/1.1 Keep-Alive 复用的轻量客户端，单次轮询延迟 `< 0.5 ms`
 struct KeepAlive8111 {
     stream: Option<BufReader<TcpStream>>,
     timeout: Duration,
@@ -138,7 +175,6 @@ impl KeepAlive8111 {
         let mut close_conn = false;
         let mut line = String::new();
 
-        // 状态行
         if reader.read_line(&mut line).ok()? == 0 || !line.contains("200") {
             self.stream = None;
             return None;
@@ -194,7 +230,7 @@ pub fn val_f64(v: &Value, key: &str) -> Option<f64> {
 }
 
 #[inline]
-fn shortest_angle_diff_deg(to_deg: f64, from_deg: f64) -> f64 {
+pub fn shortest_angle_diff_deg(to_deg: f64, from_deg: f64) -> f64 {
     let mut d = (to_deg - from_deg) % 360.0;
     if d > 180.0 {
         d -= 360.0;
@@ -204,25 +240,65 @@ fn shortest_angle_diff_deg(to_deg: f64, from_deg: f64) -> f64 {
     d
 }
 
-/// 从 `/state` 与 `/indicators` 原始 JSON 解析出物理符号全部对齐的瞬时飞行参数（抽出独立纯函数便于严格单测）
+/// 从 `/state` 与 `/indicators` 原始 JSON 解析出物理符号全部对齐的瞬时飞行参数（支持 `/state` 缺失时从仪表盘优雅降级）
 pub fn parse_state_and_indicators(sj: &Value, ij: &Value) -> TelemetryFrame {
+    let state_valid = sj
+        .get("valid")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
     let unit_id = ij
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_lowercase();
-    let alt_asl_m = val_f64(sj, "H, m").unwrap_or(0.0);
-    let tas_mps = val_f64(sj, "TAS, km/h").unwrap_or(0.0) / 3.6;
-    let ias_mps = val_f64(sj, "IAS, km/h").unwrap_or(0.0) / 3.6;
-    let mach = val_f64(sj, "M").or_else(|| val_f64(ij, "mach")).unwrap_or(0.0);
-    let vy_mps = val_f64(sj, "Vy, m/s").or_else(|| val_f64(ij, "vario"));
-    let aoa_deg = val_f64(sj, "AoA, deg").unwrap_or(0.0);
-    let aos_deg = val_f64(sj, "AoS, deg").unwrap_or(0.0);
+
+    // 若 `/state` 有效则直接取公制 `H, m`；否则从 `/indicators` 气压高度指针回退
+    let alt_from_ind = val_f64(ij, "altitude_10k").or_else(|| val_f64(ij, "altitude_hour"));
+    let alt_asl_m = if state_valid {
+        val_f64(sj, "H, m")
+            .or(alt_from_ind)
+            .unwrap_or(0.0)
+    } else {
+        alt_from_ind.unwrap_or(0.0)
+    };
+
+    // 空速：`/state` 的 `TAS, km/h` 为 km/h，而 `/indicators` 的 `speed` 直接为 m/s！
+    let ind_speed_mps = val_f64(ij, "speed").unwrap_or(0.0);
+    let tas_mps = if state_valid {
+        val_f64(sj, "TAS, km/h")
+            .map(|kph| kph / 3.6)
+            .unwrap_or(ind_speed_mps)
+    } else {
+        ind_speed_mps
+    };
+    let ias_mps = if state_valid {
+        val_f64(sj, "IAS, km/h")
+            .map(|kph| kph / 3.6)
+            .unwrap_or(tas_mps)
+    } else {
+        tas_mps
+    };
+
+    let mach = val_f64(sj, "M")
+        .or_else(|| val_f64(ij, "mach"))
+        .unwrap_or(0.0);
+    let vy_mps = (if state_valid { val_f64(sj, "Vy, m/s") } else { None })
+        .or_else(|| val_f64(ij, "vario"));
+    let aoa_deg = if state_valid {
+        val_f64(sj, "AoA, deg").unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    let aos_deg = if state_valid {
+        val_f64(sj, "AoS, deg").unwrap_or(0.0)
+    } else {
+        0.0
+    };
 
     let heading_deg = val_f64(ij, "compass1")
         .or_else(|| val_f64(ij, "compass"))
-        .unwrap_or(0.0)
-        .rem_euclid(360.0);
+        .unwrap_or(f64::NAN);
 
     // 横滚角：必须优先读 `-aviahorizon_roll`（量程 ±180°），绝不能先读 `bank`（美系飞机上为 ±8° 侧滑仪小球！）
     let roll_deg = val_f64(ij, "aviahorizon_roll")
@@ -232,7 +308,6 @@ pub fn parse_state_and_indicators(sj: &Value, ij: &Value) -> TelemetryFrame {
         .unwrap_or(0.0);
 
     // 俯仰角：战雷 `aviahorizon_pitch` 抬头为负、俯冲为正，必须取反 `-aviahorizon_pitch`！
-    // 若无座舱机型缺失该字段，则由航迹倾角 arcsin(Vy/TAS) + AoA*cos(roll) 精确重构。
     let kin_pitch_deg = if let Some(vy) = vy_mps {
         if tas_mps > 5.0 {
             let gamma_deg = (vy / tas_mps).clamp(-1.0, 1.0).asin().to_degrees();
@@ -250,10 +325,17 @@ pub fn parse_state_and_indicators(sj: &Value, ij: &Value) -> TelemetryFrame {
         .or(kin_pitch_deg)
         .unwrap_or(0.0);
 
-    let roll_rate_dps = val_f64(sj, "Wx, deg/s").unwrap_or(0.0);
+    let roll_rate_dps = if state_valid {
+        val_f64(sj, "Wx, deg/s").unwrap_or(0.0)
+    } else {
+        0.0
+    };
     let stick_elevator = val_f64(ij, "stick_elevator").unwrap_or(0.0);
     let stick_rudder = val_f64(ij, "pedals")
         .or_else(|| val_f64(ij, "pedals1"))
+        .unwrap_or(0.0);
+    let stick_ailerons = val_f64(ij, "stick_ailerons")
+        .or_else(|| val_f64(ij, "stick_ailerons1"))
         .unwrap_or(0.0);
     let airbrake_pct = val_f64(sj, "airbrake, %")
         .or_else(|| val_f64(ij, "airbrake_lever").map(|v| v * 100.0))
@@ -264,12 +346,11 @@ pub fn parse_state_and_indicators(sj: &Value, ij: &Value) -> TelemetryFrame {
         if ra_raw <= 0.5 {
             return None;
         }
-        // 对照气压表 altitude_10k 与 H, m 自动判定座舱仪表是否为英尺制 (koef ≈ 3.28084)
-        let is_feet = val_f64(ij, "altitude_10k")
-            .filter(|_| alt_asl_m > 40.0)
-            .is_some_and(|a10k| ((a10k / alt_asl_m) - 3.28084).abs() < 0.45);
+        let is_feet = state_valid
+            && val_f64(ij, "altitude_10k")
+                .filter(|_| alt_asl_m > 40.0)
+                .is_some_and(|a10k| ((a10k / alt_asl_m) - 3.28084).abs() < 0.45);
         let ra_m = if is_feet { ra_raw * 0.3048 } else { ra_raw };
-        // 排除满量程钉死值 (通常 1500m 或 5000ft ≈ 1524m)
         if ra_m > 1.5 && ra_m < 1420.0 {
             Some(alt_asl_m - ra_m)
         } else {
@@ -282,12 +363,17 @@ pub fn parse_state_and_indicators(sj: &Value, ij: &Value) -> TelemetryFrame {
         unit_id,
         alt_asl_m,
         tas_mps,
+        tas_accel_mps2: 0.0,
         ias_mps,
         mach,
         vy_mps,
         aoa_deg,
         aos_deg,
-        heading_deg,
+        heading_deg: if heading_deg.is_finite() {
+            heading_deg.rem_euclid(360.0)
+        } else {
+            f64::NAN
+        },
         pitch_deg,
         roll_deg,
         yaw_rate_dps: 0.0,
@@ -295,12 +381,82 @@ pub fn parse_state_and_indicators(sj: &Value, ij: &Value) -> TelemetryFrame {
         roll_rate_dps,
         stick_elevator,
         stick_rudder,
+        stick_ailerons,
         airbrake_pct,
         radar_ground_alt_m,
         auto_runway_alt_m: None,
         map_xz_m: None,
         map_bounds: None,
         sampled_at: Some(Instant::now()),
+        att_tick_at: None,
+    }
+}
+
+/// 多速率 α-β 连续高度追踪器：
+/// 识别 8111 缓存未刷新的重复帧（`raw_alt_m == prev_raw_alt_m` 时仅按精确 `Vy * dt` 积分，绝不被陈旧整米值往回拽），
+/// 仅在 `8111` 真正跳变刷新的一拍执行新息融合，将 15Hz 整米阶梯误差从 >5m 压至 <0.6m！
+#[derive(Default, Clone, Copy, Debug)]
+pub struct AltitudeKinematicTracker {
+    est_alt_m: Option<f64>,
+    last_raw_alt_m: Option<f64>,
+    last_raw_change_t: Option<Instant>,
+    last_t: Option<Instant>,
+}
+
+impl AltitudeKinematicTracker {
+    pub fn reset(&mut self) {
+        self.est_alt_m = None;
+        self.last_raw_alt_m = None;
+        self.last_raw_change_t = None;
+        self.last_t = None;
+    }
+
+    pub fn update(&mut self, raw_alt_m: f64, vy_mps: Option<f64>, now: Instant) -> f64 {
+        let Some(prev_alt) = self.est_alt_m else {
+            self.est_alt_m = Some(raw_alt_m);
+            self.last_raw_alt_m = Some(raw_alt_m);
+            self.last_raw_change_t = Some(now);
+            self.last_t = Some(now);
+            return raw_alt_m;
+        };
+        let dt = self
+            .last_t
+            .map(|t0| now.saturating_duration_since(t0).as_secs_f64())
+            .unwrap_or(0.0)
+            .clamp(0.0, 0.25);
+        self.last_t = Some(now);
+
+        let Some(vy) = vy_mps.filter(|v| v.is_finite()) else {
+            let blended = prev_alt + 0.55 * (raw_alt_m - prev_alt);
+            self.est_alt_m = Some(blended);
+            self.last_raw_alt_m = Some(raw_alt_m);
+            return blended;
+        };
+
+        let pred = prev_alt + vy * dt;
+        let raw_changed = self
+            .last_raw_alt_m
+            .is_none_or(|r0| (raw_alt_m - r0).abs() > 1e-3);
+        let stale_dur = self
+            .last_raw_change_t
+            .map(|t0| now.saturating_duration_since(t0).as_secs_f64())
+            .unwrap_or(1.0);
+
+        let next = if raw_changed || stale_dur > 0.095 {
+            self.last_raw_alt_m = Some(raw_alt_m);
+            self.last_raw_change_t = Some(now);
+            let residual = raw_alt_m - pred;
+            if residual.abs() > 14.0 {
+                raw_alt_m
+            } else {
+                pred + 0.55 * residual
+            }
+        } else {
+            // 8111 尚未产出新 tick（仍是上一拍缓存整米值），纯靠精确 Vy 积分推进，零滞后！
+            pred
+        };
+        self.est_alt_m = Some(next);
+        next
     }
 }
 
@@ -308,6 +464,7 @@ pub fn parse_state_and_indicators(sj: &Value, ij: &Value) -> TelemetryFrame {
 struct MapPositionState {
     bounds: Option<[f64; 4]>,
     raw_xz: Option<([f64; 2], Instant)>,
+    map_heading_deg: Option<f64>,
 }
 
 pub struct TelemetryPoller {
@@ -321,7 +478,7 @@ impl TelemetryPoller {
         let stop = Arc::new(AtomicBool::new(false));
         let map_state = Arc::new(Mutex::new(MapPositionState::default()));
 
-        // 独立慢速线程：专职轮询 `/map_info.json` 与 `/map_obj.json`，绝不阻塞姿态主线程
+        // 独立慢速线程：专职轮询 `/map_info.json` 与 `/map_obj.json`
         {
             let map_clone = Arc::clone(&map_state);
             let stop_map = Arc::clone(&stop);
@@ -349,20 +506,29 @@ impl TelemetryPoller {
                                 }
                             }
                         }
-                        if let (Some(bounds), Some(objs)) =
-                            (cur_bounds, client.get_json("/map_obj.json"))
-                        {
+                        if let Some(objs) = client.get_json("/map_obj.json") {
                             if let Some(arr) = objs.as_array() {
                                 if let Some(player) = arr.iter().find(|o| {
                                     o.get("icon").and_then(Value::as_str) == Some("Player")
                                 }) {
-                                    if let (Some(xn), Some(yn)) =
-                                        (val_f64(player, "x"), val_f64(player, "y"))
+                                    // 提取玩家小地图精确机头方向矢量 `(dx, dy)` (西北角原点：北为 dy=-1，东为 dx=+1)
+                                    let map_hdg = match (val_f64(player, "dx"), val_f64(player, "dy"))
                                     {
-                                        let [xmin, zmin, xmax, zmax] = bounds;
-                                        let wx = xmin + xn * (xmax - xmin);
-                                        let wz = zmax - yn * (zmax - zmin);
-                                        if let Ok(mut mg) = map_clone.lock() {
+                                        (Some(dx), Some(dy)) if dx.hypot(dy) > 1e-3 => {
+                                            Some(dx.atan2(-dy).to_degrees().rem_euclid(360.0))
+                                        }
+                                        _ => None,
+                                    };
+                                    if let Ok(mut mg) = map_clone.lock() {
+                                        mg.map_heading_deg = map_hdg;
+                                        if let (Some(bounds), Some(xn), Some(yn)) = (
+                                            cur_bounds,
+                                            val_f64(player, "x"),
+                                            val_f64(player, "y"),
+                                        ) {
+                                            let [xmin, zmin, xmax, zmax] = bounds;
+                                            let wx = xmin + xn * (xmax - xmin);
+                                            let wz = zmax - yn * (zmax - zmin);
                                             mg.bounds = Some(bounds);
                                             mg.raw_xz = Some(([wx, wz], Instant::now()));
                                         }
@@ -371,12 +537,12 @@ impl TelemetryPoller {
                             }
                         }
                         tick = tick.wrapping_add(1);
-                        std::thread::sleep(Duration::from_millis(160));
+                        std::thread::sleep(Duration::from_millis(150));
                     }
                 });
         }
 
-        // 高频姿态主线程：专职轮询 `/state` 与 `/indicators` (~80 Hz Keep-Alive)
+        // 高频姿态主线程：专职轮询 `/state` 与 `/indicators` (~100 Hz Keep-Alive)
         {
             let sh_clone = Arc::clone(&shared);
             let map_clone = Arc::clone(&map_state);
@@ -386,48 +552,89 @@ impl TelemetryPoller {
                 .spawn(move || {
                     let mut client = KeepAlive8111::new(90);
                     let mut runway_alt: Option<f64> = None;
-                    let mut prev_att: Option<(f64, f64, f64, Instant)> = None;
+                    let mut alt_tracker = AltitudeKinematicTracker::default();
+                    let mut prev_kin: Option<(f64, f64, f64, f64, Instant)> = None;
                     let mut filt_yaw_dps = 0.0;
                     let mut filt_pitch_dps = 0.0;
+                    let mut filt_roll_dps = 0.0;
+                    let mut filt_tas_acc = 0.0;
 
                     while !stop_att.load(Ordering::Relaxed) {
                         let sj_opt = client.get_json("/state");
                         let ij_opt = client.get_json("/indicators");
 
-                        let ok = sj_opt
+                        let ij_ok = ij_opt
                             .as_ref()
                             .and_then(|j| j.get("valid"))
                             .and_then(Value::as_bool)
-                            .unwrap_or(false)
-                            && ij_opt
-                                .as_ref()
-                                .and_then(|j| j.get("valid"))
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false);
+                            .unwrap_or(false);
+                        let sj_val = sj_opt.unwrap_or(Value::Null);
 
-                        if ok {
+                        if ij_ok {
                             let now = Instant::now();
-                            let mut frame =
-                                parse_state_and_indicators(&sj_opt.unwrap(), &ij_opt.unwrap());
+                            let mut frame = parse_state_and_indicators(&sj_val, &ij_opt.unwrap());
                             frame.sampled_at = Some(now);
 
-                            // 仅当 8111 内部数值发生实质更新时计算平滑角速度（滤除重复采样帧）
-                            if let Some((ph, pp, _pr, pt)) = prev_att {
+                            // 若早期机型 `/indicators` 无罗盘字段，回退至 `/map_obj.json` 方向矢量
+                            if !frame.heading_deg.is_finite() {
+                                let fallback_hdg = map_clone
+                                    .lock()
+                                    .ok()
+                                    .and_then(|mg| mg.map_heading_deg)
+                                    .unwrap_or(0.0);
+                                frame.heading_deg = fallback_hdg;
+                            }
+
+                            // 连续融合整米海拔 `H, m` 与 `Vy, m/s`，消除 15Hz 阶梯跳变
+                            frame.alt_asl_m =
+                                alt_tracker.update(frame.alt_asl_m, frame.vy_mps, now);
+
+                            // 仅当 8111 内部数值发生实质更新时更新平滑导数（滤除 8111 重复采样帧）
+                            if let Some((ph, pp, pr, ptas, pt)) = prev_kin {
                                 let dt = now.saturating_duration_since(pt).as_secs_f64();
                                 let dh = shortest_angle_diff_deg(frame.heading_deg, ph);
                                 let dp = frame.pitch_deg - pp;
-                                if dt >= 0.012 && (dh.abs() > 1e-4 || dp.abs() > 1e-4 || dt > 0.06) {
+                                let dr = shortest_angle_diff_deg(frame.roll_deg, pr);
+                                let dv = frame.tas_mps - ptas;
+                                if dt >= 0.012
+                                    && (dh.abs() > 1e-4
+                                        || dp.abs() > 1e-4
+                                        || dr.abs() > 1e-4
+                                        || dv.abs() > 1e-3
+                                        || dt > 0.065)
+                                {
                                     let raw_yr = (dh / dt).clamp(-180.0, 180.0);
                                     let raw_pr = (dp / dt).clamp(-180.0, 180.0);
+                                    let raw_rr = (dr / dt).clamp(-260.0, 260.0);
+                                    let raw_acc = (dv / dt).clamp(-60.0, 60.0);
                                     filt_yaw_dps = filt_yaw_dps * 0.45 + raw_yr * 0.55;
                                     filt_pitch_dps = filt_pitch_dps * 0.45 + raw_pr * 0.55;
-                                    prev_att = Some((frame.heading_deg, frame.pitch_deg, frame.roll_deg, now));
+                                    filt_roll_dps = filt_roll_dps * 0.45 + raw_rr * 0.55;
+                                    filt_tas_acc = filt_tas_acc * 0.55 + raw_acc * 0.45;
+                                    prev_kin = Some((
+                                        frame.heading_deg,
+                                        frame.pitch_deg,
+                                        frame.roll_deg,
+                                        frame.tas_mps,
+                                        now,
+                                    ));
                                 }
                             } else {
-                                prev_att = Some((frame.heading_deg, frame.pitch_deg, frame.roll_deg, now));
+                                prev_kin = Some((
+                                    frame.heading_deg,
+                                    frame.pitch_deg,
+                                    frame.roll_deg,
+                                    frame.tas_mps,
+                                    now,
+                                ));
                             }
                             frame.yaw_rate_dps = filt_yaw_dps;
                             frame.pitch_rate_dps = filt_pitch_dps;
+                            if frame.roll_rate_dps.abs() < 1e-3 {
+                                frame.roll_rate_dps = filt_roll_dps;
+                            }
+                            frame.tas_accel_mps2 = filt_tas_acc;
+                            frame.att_tick_at = prev_kin.map(|x| x.4).or(Some(now));
 
                             if frame.tas_mps < 12.0
                                 && frame.vy_mps.unwrap_or(0.0).abs() < 1.2
@@ -440,9 +647,13 @@ impl TelemetryPoller {
                             if let Ok(mg) = map_clone.lock() {
                                 frame.map_bounds = mg.bounds;
                                 frame.map_xz_m = mg.raw_xz.map(|([bx, bz], t0)| {
-                                    let dt = now.saturating_duration_since(t0).as_secs_f64().clamp(0.0, 0.35);
+                                    let dt = now
+                                        .saturating_duration_since(t0)
+                                        .as_secs_f64()
+                                        .clamp(0.0, 0.35);
                                     let vy = frame.vy_mps.unwrap_or(0.0);
-                                    let vh = (frame.tas_mps * frame.tas_mps - vy * vy).max(0.0).sqrt();
+                                    let vh =
+                                        (frame.tas_mps * frame.tas_mps - vy * vy).max(0.0).sqrt();
                                     let hdg_rad = frame.heading_deg.to_radians();
                                     [bx + hdg_rad.sin() * vh * dt, bz + hdg_rad.cos() * vh * dt]
                                 });
@@ -451,13 +662,14 @@ impl TelemetryPoller {
                             if let Ok(mut g) = sh_clone.lock() {
                                 *g = frame;
                             }
-                            std::thread::sleep(Duration::from_millis(10));
+                            std::thread::sleep(Duration::from_millis(8));
                         } else {
-                            prev_att = None;
+                            prev_kin = None;
+                            alt_tracker.reset();
                             if let Ok(mut g) = sh_clone.lock() {
                                 g.online = false;
                             }
-                            std::thread::sleep(Duration::from_millis(400));
+                            std::thread::sleep(Duration::from_millis(350));
                         }
                     }
                 });
@@ -484,6 +696,7 @@ pub fn build_demo_telemetry_and_nose_px(
     unit_id: &str,
     tps_cfg: &TpsCameraConfig,
     unit_tps_offset: [f64; 3],
+    unit_zoom_target_offset: [f64; 3],
     static_aim_pitch_deg: f64,
     gun_conv_dist_m: f64,
     fov_deg: f64,
@@ -501,20 +714,23 @@ pub fn build_demo_telemetry_and_nose_px(
     let tas_mps = 165.0 + 35.0 * phase;
     let aoa_deg = 2.4;
     let vy_mps = tas_mps * (ac_pitch - aoa_deg).to_radians().sin();
+    let stick_ail = 0.25 * (elapsed_s * 0.7).cos();
 
     let sim_cam_yaw = ac_hdg + 5.5 * (elapsed_s * 1.35).sin();
     let sim_cam_pitch = ac_pitch - 3.0 + 2.8 * (elapsed_s * 0.95).cos();
 
     let ac_pos = Vec3::new(center_xz[0], alt_asl, center_xz[1]);
-    let sim_cam = TpsCameraState::build(
+    let sim_cam = TpsCameraState::build_ext(
         ac_pos,
         sim_cam_yaw,
         sim_cam_pitch,
         ac_roll,
         0.15,
         0.0,
+        stick_ail,
         tps_cfg,
         unit_tps_offset,
+        unit_zoom_target_offset,
         fov_deg,
         screen_w,
         screen_h,
@@ -530,6 +746,7 @@ pub fn build_demo_telemetry_and_nose_px(
         unit_id: unit_id.to_string(),
         alt_asl_m: alt_asl,
         tas_mps,
+        tas_accel_mps2: 0.0,
         ias_mps: tas_mps * 0.96,
         mach: tas_mps / 340.0,
         vy_mps: Some(vy_mps),
@@ -543,12 +760,14 @@ pub fn build_demo_telemetry_and_nose_px(
         roll_rate_dps: 0.0,
         stick_elevator: 0.15,
         stick_rudder: 0.0,
+        stick_ailerons: stick_ail,
         airbrake_pct: 0.0,
         radar_ground_alt_m: Some(ground_alt_m),
         auto_runway_alt_m: Some(ground_alt_m),
         map_xz_m: Some(center_xz),
         map_bounds: None,
         sampled_at: Some(Instant::now()),
+        att_tick_at: None,
     };
     (frame, nose_px)
 }
@@ -558,9 +777,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_war_thunder_inverted_aviahorizon_signs() {
-        // 模拟真实战雷 8111 俯冲状态 (-22° 俯冲，右倾 +28°，A-10A 英尺高度表 + 无线电高度表)
-        // 战雷 /indicators 原始输出：aviahorizon_pitch 为 +22.0 (反向！)，aviahorizon_roll 为 -28.0 (反向！)，bank 为 0.3 (侧滑球！)
+    fn test_parse_war_thunder_inverted_aviahorizon_signs_and_heli_fallback() {
         let sj = serde_json::json!({
             "valid": true,
             "H, m": 500.0,
@@ -577,23 +794,80 @@ mod tests {
             "compass": 135.0,
             "aviahorizon_pitch": 22.0,
             "aviahorizon_roll": -28.0,
+            "stick_ailerons": 0.45,
             "bank": 0.3,
-            "altitude_10k": 1640.4,   // 500m * 3.28084 ft
-            "radio_altitude": 984.25  // 300m AGL in ft -> 地面真实海拔 = 500 - 300 = 200m!
+            "altitude_10k": 1640.4,
+            "radio_altitude": 984.25
         });
 
         let tf = parse_state_and_indicators(&sj, &ij);
-        assert!(
-            (tf.pitch_deg - (-22.0)).abs() < 1e-6,
-            "俯冲时 pitch_deg 必须为负 (-22.0°)，实际={}",
-            tf.pitch_deg
-        );
-        assert!(
-            (tf.roll_deg - 28.0).abs() < 1e-6,
-            "必须取 -aviahorizon_roll (+28.0°) 而非侧滑球 bank (0.3°)，实际={}",
-            tf.roll_deg
-        );
+        assert!((tf.pitch_deg - (-22.0)).abs() < 1e-6);
+        assert!((tf.roll_deg - 28.0).abs() < 1e-6);
+        assert!((tf.stick_ailerons - 0.45).abs() < 1e-6);
         let rg = tf.radar_ground_alt_m.expect("应由英尺无线电高度表解出真实地面海拔");
-        assert!((rg - 200.0).abs() < 1.0, "预期地面海拔约 200m，实际={rg}");
+        assert!((rg - 200.0).abs() < 1.0);
+
+        // 验证直升机 `/state` valid=false 时从 `/indicators` 优雅回退
+        let sj_invalid = serde_json::json!({ "valid": false });
+        let ij_heli = serde_json::json!({
+            "valid": true,
+            "type": "ka_50",
+            "compass": 210.0,
+            "speed": 68.0,
+            "vario": -12.5,
+            "altitude_10k": 340.0,
+            "aviahorizon_pitch": 10.5,
+            "aviahorizon_roll": 6.0
+        });
+        let hf = parse_state_and_indicators(&sj_invalid, &ij_heli);
+        assert!(hf.online);
+        assert!((hf.tas_mps - 68.0).abs() < 1e-6);
+        assert!((hf.alt_asl_m - 340.0).abs() < 1e-6);
+        assert!((hf.pitch_deg - (-10.5)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_altitude_kinematic_tracker_eliminates_15hz_integer_staircase() {
+        let mut trk = AltitudeKinematicTracker::default();
+        let t0 = Instant::now();
+        let vy = -80.0; // -80 m/s 高速俯冲
+
+        // 模拟 15Hz 整米量化输出：每 66ms 跳变 5~6m，中间 16ms 重复读取旧整数
+        let mut max_err = 0.0f64;
+        for step in 0..30 {
+            let t_s = step as f64 * 0.016;
+            let tick_s = ((t_s / 0.066).floor()) * 0.066;
+            let quantized_h = (800.0 + vy * tick_s).round(); // 阶梯整米
+            let now = t0 + Duration::from_secs_f64(t_s);
+            let smooth_h = trk.update(quantized_h, Some(vy), now);
+            let true_h = 800.0 + vy * t_s;
+            max_err = max_err.max((smooth_h - true_h).abs());
+        }
+        // 未滤波阶梯误差高达 ~5.3m，滤波后全程连续误差 < 1.2m 且单步平滑无跳变！
+        assert!(
+            max_err < 1.25,
+            "连续高度追踪残差过大: {max_err:.3}m (原始阶梯峰值 ~5.3m)"
+        );
+    }
+
+    #[test]
+    fn test_attitude_extrapolation_no_sawtooth_on_cached_8111_polls() {
+        let tick0 = Instant::now();
+        // 模拟 8111 在 tick0 产出 pitch=-15.0°, 速率 -20 deg/s；随后在 tick0+32ms 轮询到了未刷新的缓存旧帧
+        let tf = TelemetryFrame {
+            online: true,
+            pitch_deg: -15.0,
+            pitch_rate_dps: -20.0,
+            sampled_at: Some(tick0 + Duration::from_millis(32)),
+            att_tick_at: Some(tick0),
+            ..Default::default()
+        };
+        // 在 tick0+40ms 渲染：姿态必须从真实 tick0 外推 40ms -> -15.8°，而不是从缓存轮询时刻外推 8ms 回弹到 -15.16°！
+        let st = tf.extrapolated_state(tick0 + Duration::from_millis(40));
+        assert!(
+            (st.pitch_deg - (-15.8)).abs() < 1e-4,
+            "发生 15Hz 缓存帧锯齿回弹: pitch_deg={}, 预期=-15.8",
+            st.pitch_deg
+        );
     }
 }

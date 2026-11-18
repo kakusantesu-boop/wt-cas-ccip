@@ -4,7 +4,7 @@
   "projectId": "wt-cas-ccip",
   "title": "战雷第三人称 CAS 航弹与火箭弹 CCIP 验证原型",
   "profile": "single-blueprint",
-  "state": "real-host-evidence",
+  "state": "automated-evidence",
   "authorityFile": "总设计案.md",
   "nextFile": "NEXT.md",
   "blueprintPolicy": {
@@ -54,6 +54,18 @@
       "status": "resolved",
       "resultEvidence": "8/8 单测全通：(1) DirtyEnvelope 单并集外扩包络盒+固定显示器步幅，test_zero_ghost_trail_across_all_bank_directions 验证 0 残影字节；(2) 450ms 相机相对偏角惯性保持滤波+移除逐帧 SetWindowPos 彻底消除频闪；(3) 二维积分图正交四臂+对角空腔卷积与分离轴质心支持半透明红色准星并排斥同色鼠标大圆圈及敌方红标",
       "returnTo": "P4"
+    },
+    {
+      "id": "REF-P4-03",
+      "kind": "temporary-problem-refinement",
+      "parentStep": "P4",
+      "problem": "全量离线深度工程审查与缺陷根治（火箭马赫阻力偏大、同心鼠标圆圈失锁、15Hz 遥测海拔阶梯与姿态锯齿、武直词库误判、DWM 带宽与焦点误触）",
+      "triggerEvidence": "驾驶员要求暂不实机测试，专注排查修复所有可在离线阶段发现并验证的算法与工程问题",
+      "persistent": false,
+      "expandsProductScope": false,
+      "status": "resolved",
+      "resultEvidence": "15/15 单测与 --self-test 全通：补齐 Dagor rocket_cd0(Mach) 与 2m 导轨及自毁门控、内颈 3-of-4 序统计量同心圆圈免疫与 Auto/默认白准星、多速率 α-β 高度滤波与真实 Tick 时间戳、104 架武直识别与开镜靶点偏移、世界空间阻尼惯性保持、1-Euro 防抖及 UpdateLayeredWindowIndirect 脏矩形合成",
+      "returnTo": "P4"
     }
   ],
   "discussionDirections": [
@@ -80,7 +92,7 @@
   "acceptance": {
     "automated": "passed",
     "staticPreview": "passed",
-    "realHost": "passed",
+    "realHost": "pending",
     "driver": {
       "status": "pending",
       "source": "driver"

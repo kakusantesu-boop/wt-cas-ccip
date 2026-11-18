@@ -1,4 +1,4 @@
-//! 三维空地航弹与空射火箭弹物理解算引擎 (RK2 / Heun + 地形高程精确求交)
+//! 三维空地航弹与空射火箭弹物理解算引擎 (RK2 / Heun + 火箭跨音速马赫阻力/导轨离轨/自毁门控 + 地形二分求交)
 //! 世界坐标系约定 (与 Dagor / 婴儿弹道计算机一致)：+X 向东，+Y 向上 (海拔 m)，+Z 向北。
 
 use crate::atmosphere::Atmosphere;
@@ -8,6 +8,22 @@ use crate::terrain_pack::TerrainSource;
 pub const G: f64 = 9.81;
 pub const DEG_TO_RAD: f64 = std::f64::consts::PI / 180.0;
 pub const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
+
+/// DagorEngine 尾翼火箭标准零升马赫阻力极曲线 `C_d0(Mach)`
+/// - 亚音速 (`M <= 0.8`): 恒为 `0.29`
+/// - 跨音速激波区 (`0.8 < M <= 1.1`): 三次 Hermite 平滑抬升至波阻峰值 `0.68`
+/// - 超音速区 (`M > 1.1`): 按 `0.26 + 0.42 / (1 + 0.55 * (M - 1.1))` 渐近衰减
+#[inline]
+pub fn rocket_cd0(mach: f64) -> f64 {
+    if mach <= 0.8 {
+        0.29
+    } else if mach <= 1.1 {
+        let u = (mach - 0.8) / 0.3;
+        0.29 + 0.39 * (u * u * (3.0 - 2.0 * u))
+    } else {
+        0.26 + 0.42 / (1.0 + 0.55 * (mach - 1.1))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Vec3 {
@@ -150,19 +166,21 @@ impl AircraftKinematics {
         aos_deg: f64,
     ) -> Self {
         let basis = BodyBasis::from_euler_deg(heading_deg, pitch_deg, roll_deg);
-        let alpha = aoa_deg * DEG_TO_RAD;
-        let beta = aos_deg * DEG_TO_RAD;
+        let spd = tas_mps.max(0.0);
+        // 直升机低速悬停 (< 8 m/s) 时下洗流会导致 8111 AoA/AoS 剧烈跳变，按空速平滑衰减消除方向翻转
+        let aero_weight = ((spd - 2.0) / 6.0).clamp(0.0, 1.0);
+        let alpha = (aoa_deg.clamp(-45.0, 45.0) * aero_weight) * DEG_TO_RAD;
+        let beta = (aos_deg.clamp(-45.0, 45.0) * aero_weight) * DEG_TO_RAD;
         let (sa, ca) = alpha.sin_cos();
         let (sb, cb) = beta.sin_cos();
 
         // 正攻角 alpha > 0 时机头高于气流速度矢量，速度方向沿机体 -up 偏转
         let aero_dir = (basis.fwd * (ca * cb) - basis.up * (sa * cb) + basis.right * sb)
             .normalized_or(basis.fwd);
-        let mut vel_world = aero_dir * tas_mps.max(0.0);
+        let mut vel_world = aero_dir * spd;
 
         // 若 8111 提供了精确垂直升降率 Vy，修正垂直分量并保持总真空速模长守恒
         if let Some(vy) = vy_mps_opt.filter(|v| v.is_finite()) {
-            let spd = tas_mps.max(0.0);
             if spd > 1.0 && vy.abs() <= spd * 0.995 {
                 let horiz_sq = (spd * spd - vy * vy).max(0.0);
                 let cur_h = vel_world.x.hypot(vel_world.z);
@@ -182,7 +200,7 @@ impl AircraftKinematics {
             heading_deg,
             pitch_deg,
             roll_deg,
-            tas_mps,
+            tas_mps: spd,
         }
     }
 }
@@ -220,6 +238,50 @@ pub struct ImpactSolution {
     pub impact_speed_mps: f64,
     pub slant_range_m: f64,
     pub ground_elev_m: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum RocketSimOutcome {
+    GroundHit(ImpactSolution),
+    SelfDestructed {
+        slant_range_m: f64,
+        time_of_flight_s: f64,
+        by_distance: bool,
+    },
+    Unreachable,
+}
+
+/// 在跨越地表的相邻两步 `[p0, p1]` 间执行 3 步非线性高程二分 + 最终割线精化，陡坡山地垂直误差 `< 0.005 m`
+#[inline]
+fn refine_terrain_hit(p0: Vec3, p1: Vec3, terrain: &TerrainSource) -> (Vec3, f64, f64) {
+    let mut lo = 0.0f64;
+    let mut hi = 1.0f64;
+    let mut h_lo = (p0.y - terrain.height_at(p0.x, p0.z)).max(0.0);
+    let mut h_hi = p1.y - terrain.height_at(p1.x, p1.z);
+
+    for _ in 0..3 {
+        let mid = 0.5 * (lo + hi);
+        let pm = p0.lerp(p1, mid);
+        let hm = pm.y - terrain.height_at(pm.x, pm.z);
+        if hm > 0.0 {
+            lo = mid;
+            h_lo = hm;
+        } else {
+            hi = mid;
+            h_hi = hm;
+        }
+    }
+
+    let denom = h_lo - h_hi;
+    let sub = if denom > 1e-9 {
+        (h_lo / denom).clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let frac = (lo + (hi - lo) * sub).clamp(0.0, 1.0);
+    let hit = p0.lerp(p1, frac);
+    let ground_y = terrain.height_at(hit.x, hit.z);
+    (Vec3::new(hit.x, ground_y, hit.z), frac, ground_y)
 }
 
 /// 三维航弹 CCIP 解算 (支持普通流线弹、钝头弹、Snakeye/AIR 延时开伞减速弹)
@@ -272,7 +334,6 @@ pub fn simulate_bomb_ccip(
     let mut t = 0.0;
     while t < tuning.max_time_s {
         let prev_pos = pos;
-        let prev_ground = terrain.height_at(prev_pos.x, prev_pos.z);
 
         let a1 = accel(pos, vel, t);
         let vel_pred = vel + a1 * dt;
@@ -283,15 +344,8 @@ pub fn simulate_bomb_ccip(
         vel = vel + (a1 + a2) * (0.5 * dt);
         t += dt;
 
-        let cur_ground = terrain.height_at(pos.x, pos.z);
-        let h_after = pos.y - cur_ground;
-        if h_after <= 0.0 {
-            let h_before = (prev_pos.y - prev_ground).max(0.0);
-            let denom = h_before - h_after;
-            let frac = if denom > 1e-9 { (h_before / denom).clamp(0.0, 1.0) } else { 0.0 };
-            let hit = prev_pos.lerp(pos, frac);
-            let ground_y = terrain.height_at(hit.x, hit.z);
-            let exact_hit = Vec3::new(hit.x, ground_y, hit.z);
+        if pos.y <= terrain.height_at(pos.x, pos.z) {
+            let (exact_hit, frac, ground_y) = refine_terrain_hit(prev_pos, pos, terrain);
             return Some(ImpactSolution {
                 impact_pos: exact_hit,
                 time_of_flight_s: delay + (t - dt + frac * dt),
@@ -304,38 +358,55 @@ pub fn simulate_bomb_ccip(
     None
 }
 
-/// 三维空射无制导火箭弹 CCIP 解算 (支持两级推进、烧蚀减重、导轨离轨与尾翼风标效应)
-pub fn simulate_rocket_ccip(
+/// 三维空射无制导火箭弹完整状态解算（含跨音速 `rocket_cd0(Mach)`、2m 发射管导轨支撑、两级烧蚀、尾翼风标与最大射程/时间自毁门控）
+pub fn simulate_rocket_ccip_detailed(
     kin: &AircraftKinematics,
     rocket: &RocketSpec,
     launcher_pitch_deg: f64,
     atm: &Atmosphere,
     terrain: &TerrainSource,
     tuning: &BallisticTuning,
-) -> Option<ImpactSolution> {
+) -> RocketSimOutcome {
     let dt = tuning.dt.clamp(0.001, 0.01);
-    let max_t = rocket.time_life.clamp(3.0, tuning.max_time_s);
+    let t_life = if rocket.time_life > 0.5 {
+        rocket.time_life.min(tuning.max_time_s)
+    } else {
+        tuning.max_time_s
+    };
+    let max_dist = if rocket.max_distance > 50.0 {
+        rocket.max_distance
+    } else {
+        0.0
+    };
 
     let rail_dir = kin.basis.pitched_axis(launcher_pitch_deg);
     let mount_offset = kin.basis.local_to_world([0.5, -0.65, 0.0]);
-    let mut pos = kin.pos_world + mount_offset;
-    let base_vel = if rocket.use_start_speed { kin.vel_world } else { Vec3::default() };
-    let mut vel = base_vel + rail_dir * rocket.start_speed.max(0.0);
+    let launch_origin = kin.pos_world + mount_offset;
+    let mut pos = launch_origin;
+    let base_vel = if rocket.use_start_speed {
+        kin.vel_world
+    } else {
+        Vec3::default()
+    };
+    let v_init = rocket.start_speed.max(0.0);
+    let mut vel = base_vel + rail_dir * v_init;
     let mut body_axis = rail_dir;
 
     if pos.y <= terrain.height_at(pos.x, pos.z) {
-        return None;
+        return RocketSimOutcome::Unreachable;
     }
 
     let area = std::f64::consts::PI * 0.25 * rocket.caliber * rocket.caliber;
-    let c_drag = 0.5 * rocket.cx_k * area;
-
     let t0_start = rocket.fire_delay.max(0.0);
     let t0_end = t0_start + rocket.time_fire0.max(0.0);
     let t1_end = t0_end + rocket.time_fire1.max(0.0);
     let m0 = rocket.mass.max(0.1);
     let m1 = rocket.mass_end.clamp(0.05, m0);
-    let m2 = rocket.mass_end1.clamp(0.05, m1);
+    let m2 = if rocket.time_fire1 > 0.0 {
+        rocket.mass_end1.clamp(0.05, m1)
+    } else {
+        m1
+    };
 
     let stage_at = |tt: f64| -> (f64, f64) {
         if tt < t0_start {
@@ -351,63 +422,136 @@ pub fn simulate_rocket_ccip(
         }
     };
 
-    // 尾翼风标效应：离轨后火箭纵轴按动压与稳定臂快速转向相对速度方向
-    let weathercock_rate = (4.0 + 18.0 * rocket.dist_cm_to_stab.clamp(0.01, 0.5)).clamp(4.0, 16.0);
+    let drag_coeff = |spd: f64, y_asl: f64| -> f64 {
+        if rocket.cx_mach {
+            let mach = spd / atm.sonic_speed(y_asl);
+            rocket.cx_k * rocket_cd0(mach)
+        } else {
+            rocket.cx_k
+        }
+    };
 
-    let accel = |p: Vec3, v: Vec3, axis: Vec3, tt: f64| -> Vec3 {
+    let accel_free = |p: Vec3, v: Vec3, axis: Vec3, tt: f64| -> Vec3 {
         let (mass, thrust) = stage_at(tt);
         let spd = v.norm();
         let v_dir = v.normalized_or(axis);
-        let f_drag = c_drag * atm.density(p.y) * spd * spd;
+        let cd = drag_coeff(spd, p.y);
+        let f_drag = 0.5 * cd * area * atm.density(p.y) * spd * spd;
         (axis * thrust - v_dir * f_drag) * (1.0 / mass) + Vec3::new(0.0, -G, 0.0)
     };
 
+    // 发射巢/导轨离轨阶段：初速 < 5 m/s 且沿管滑行距离 < 2.0 m 时，法向重力由发射管壁支撑，不产生管内虚假下垂
+    let mut on_rail = v_init < 5.0 && (rocket.force0 > 0.0 && rocket.time_fire0 > 0.0);
+    let mut rail_dist = 0.0f64;
+    let mut u_tube = v_init;
+    let stab_gain = 1.0 + 4.0 * rocket.dist_cm_to_stab.clamp(0.0, 0.5);
+
     let mut t = 0.0;
-    while t < max_t {
+    while t < t_life {
         let prev_pos = pos;
-        let prev_ground = terrain.height_at(prev_pos.x, prev_pos.z);
 
-        // 导轨离轨前 ~0.03s 锁死发射轴，离轨后受气动尾翼对准相对气流
-        if t > 0.03 && vel.norm() > 5.0 {
-            let v_hat = vel.normalized_or(body_axis);
-            let blend = (weathercock_rate * dt).clamp(0.0, 1.0);
-            body_axis = body_axis.lerp(v_hat, blend).normalized_or(v_hat);
+        if on_rail {
+            let (mass, thrust) = stage_at(t);
+            if t < t0_start {
+                // 点火延迟期内随发射巢一同匀速运动
+                pos = pos + base_vel * dt;
+                vel = base_vel;
+                t += dt;
+            } else if thrust > 0.0 && rail_dist < 2.0 {
+                let spd = vel.norm();
+                let cd = drag_coeff(spd, pos.y);
+                let f_drag = 0.5 * cd * area * atm.density(pos.y) * spd * spd;
+                let a_tube = ((thrust - f_drag) / mass - G * rail_dir.y).max(0.0);
+                let u_next = u_tube + a_tube * dt;
+                let u_mid = 0.5 * (u_tube + u_next);
+                rail_dist += u_mid * dt;
+                u_tube = u_next;
+                pos = pos + (base_vel + rail_dir * u_mid) * dt;
+                vel = base_vel + rail_dir * u_tube;
+                t += dt;
+            } else {
+                on_rail = false;
+                continue;
+            }
+        } else {
+            let spd_now = vel.norm();
+            let axis_next = if spd_now > 5.0 {
+                let v_hat = vel.normalized_or(body_axis);
+                // 尾翼风标收拢速率与空速动压成正比，对齐 wt-ballistic-visualizer `0.0025 * spd * dt`
+                let rate = (0.0025 * spd_now * stab_gain).clamp(2.5, 18.0);
+                let blend = (rate * dt).clamp(0.0, 1.0);
+                body_axis.lerp(v_hat, blend).normalized_or(v_hat)
+            } else {
+                body_axis
+            };
+
+            let a1 = accel_free(pos, vel, body_axis, t);
+            let mut vel_pred = vel + a1 * dt;
+            if vel_pred.norm() > rocket.end_speed && rocket.end_speed > 50.0 {
+                vel_pred = vel_pred.normalized_or(body_axis) * rocket.end_speed;
+            }
+            let pos_pred = pos + vel * dt;
+            let a2 = accel_free(pos_pred, vel_pred, axis_next, t + dt);
+
+            pos = pos + (vel + vel_pred) * (0.5 * dt);
+            vel = vel + (a1 + a2) * (0.5 * dt);
+            if vel.norm() > rocket.end_speed && rocket.end_speed > 50.0 {
+                vel = vel.normalized_or(axis_next) * rocket.end_speed;
+            }
+            body_axis = axis_next;
+            t += dt;
         }
 
-        let a1 = accel(pos, vel, body_axis, t);
-        let mut vel_pred = vel + a1 * dt;
-        if vel_pred.norm() > rocket.end_speed && rocket.end_speed > 50.0 {
-            vel_pred = vel_pred.normalized_or(body_axis) * rocket.end_speed;
-        }
-        let pos_pred = pos + vel * dt;
-        let a2 = accel(pos_pred, vel_pred, body_axis, t + dt);
-
-        pos = pos + (vel + vel_pred) * (0.5 * dt);
-        vel = vel + (a1 + a2) * (0.5 * dt);
-        if vel.norm() > rocket.end_speed && rocket.end_speed > 50.0 {
-            vel = vel.normalized_or(body_axis) * rocket.end_speed;
-        }
-        t += dt;
-
-        let cur_ground = terrain.height_at(pos.x, pos.z);
-        let h_after = pos.y - cur_ground;
-        if h_after <= 0.0 {
-            let h_before = (prev_pos.y - prev_ground).max(0.0);
-            let denom = h_before - h_after;
-            let frac = if denom > 1e-9 { (h_before / denom).clamp(0.0, 1.0) } else { 0.0 };
-            let hit = prev_pos.lerp(pos, frac);
-            let ground_y = terrain.height_at(hit.x, hit.z);
-            let exact_hit = Vec3::new(hit.x, ground_y, hit.z);
-            return Some(ImpactSolution {
+        if pos.y <= terrain.height_at(pos.x, pos.z) {
+            let (exact_hit, frac, ground_y) = refine_terrain_hit(prev_pos, pos, terrain);
+            let hit_tof = t - dt + frac * dt;
+            let flight_dist = (exact_hit - launch_origin).norm();
+            if max_dist > 0.0 && flight_dist > max_dist {
+                return RocketSimOutcome::SelfDestructed {
+                    slant_range_m: max_dist,
+                    time_of_flight_s: hit_tof,
+                    by_distance: true,
+                };
+            }
+            return RocketSimOutcome::GroundHit(ImpactSolution {
                 impact_pos: exact_hit,
-                time_of_flight_s: t - dt + frac * dt,
+                time_of_flight_s: hit_tof,
                 impact_speed_mps: vel.norm(),
                 slant_range_m: (exact_hit - kin.pos_world).norm(),
                 ground_elev_m: ground_y,
             });
         }
+
+        let traveled = (pos - launch_origin).norm();
+        if max_dist > 0.0 && traveled >= max_dist {
+            return RocketSimOutcome::SelfDestructed {
+                slant_range_m: traveled,
+                time_of_flight_s: t,
+                by_distance: true,
+            };
+        }
     }
-    None
+
+    RocketSimOutcome::SelfDestructed {
+        slant_range_m: (pos - launch_origin).norm(),
+        time_of_flight_s: t,
+        by_distance: false,
+    }
+}
+
+/// 兼容简写接口：仅当火箭弹在自毁前命中地表时返回 `Some(ImpactSolution)`
+pub fn simulate_rocket_ccip(
+    kin: &AircraftKinematics,
+    rocket: &RocketSpec,
+    launcher_pitch_deg: f64,
+    atm: &Atmosphere,
+    terrain: &TerrainSource,
+    tuning: &BallisticTuning,
+) -> Option<ImpactSolution> {
+    match simulate_rocket_ccip_detailed(kin, rocket, launcher_pitch_deg, atm, terrain, tuning) {
+        RocketSimOutcome::GroundHit(sol) => Some(sol),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -473,5 +617,61 @@ mod tests {
         // Hydra-70 推重比远高于二战 HVAR，同等俯冲角飞行时间更短、下坠更小（落点更远）
         assert!(s_hydra.time_of_flight_s < s_hvar.time_of_flight_s);
         assert!(s_hydra.impact_pos.x > s_hvar.impact_pos.x + 15.0);
+    }
+
+    #[test]
+    fn test_rocket_mach_drag_matches_datamined_statcard_burnout_speed_and_self_destruct() {
+        let db = CasDatabase::load_embedded_or_disk(None).unwrap();
+        let s24 = db.rockets.get("su_s_24_rocket").unwrap();
+        let hydra = db.rockets.get("us_hydra_70_m247").unwrap();
+        let atm = Atmosphere::standard_15c();
+
+        // 验证悬停静止发射 (v_ac = 0) 下关机极速与拆包资料卡 maxSpeed (S-24: 410m/s, Hydra-70: 739m/s) 高度吻合！
+        // 若漏乘 rocket_cd0(Mach)（原 bug），Hydra-70 关机速度会暴跌至 ~665 m/s，误差超过 70 m/s！
+        for (spec, expected_vmax) in [(s24, 410.0), (hydra, 739.0)] {
+            let area = std::f64::consts::PI * 0.25 * spec.caliber * spec.caliber;
+            let dt = 0.002;
+            let mut v = spec.start_speed;
+            let mut t = 0.0;
+            while t < spec.time_fire0 {
+                let f = t / spec.time_fire0;
+                let m = spec.mass + (spec.mass_end - spec.mass) * f;
+                let cd = spec.cx_k * rocket_cd0(v / atm.sonic_speed(100.0));
+                let drag = 0.5 * cd * area * atm.density(100.0) * v * v;
+                v += ((spec.force0 - drag) / m) * dt;
+                t += dt;
+            }
+            let rel_err = (v - expected_vmax).abs() / expected_vmax;
+            assert!(
+                rel_err < 0.025,
+                "{} 关机极速偏差过大: sim={v:.1} m/s, statcard={expected_vmax:.1} m/s (rel_err={rel_err:.4})",
+                spec.id
+            );
+        }
+
+        // 验证高空远距平射触发 maxDistance 空中自毁，绝不伪造地面落点
+        let high_kin = AircraftKinematics::from_telemetry(
+            Vec3::new(0.0, 4500.0, 0.0),
+            0.0,
+            -5.0,
+            0.0,
+            220.0,
+            None,
+            0.0,
+            0.0,
+        );
+        let terrain = TerrainSource::Flat { ground_alt_m: 0.0 };
+        let out = simulate_rocket_ccip_detailed(
+            &high_kin,
+            hydra,
+            0.0,
+            &atm,
+            &terrain,
+            &BallisticTuning::default(),
+        );
+        assert!(
+            matches!(out, RocketSimOutcome::SelfDestructed { by_distance: true, .. }),
+            "超远距 (>6200m) 发射 Hydra-70 必须触发距离自毁门控，实际={out:?}"
+        );
     }
 }

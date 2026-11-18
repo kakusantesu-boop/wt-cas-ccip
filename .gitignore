@@ -4,3 +4,5 @@
 __pycache__/
 *.pdb
 *.partial
+cas_ccip_config.json
+/dist/cas_ccip_config.json

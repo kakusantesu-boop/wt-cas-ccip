@@ -1,6 +1,6 @@
 [package]
 name = "wt-cas-ccip"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "War Thunder non-intrusive third-person CAS bomb & rocket CCIP prototype"
 
